@@ -42,6 +42,8 @@ DEFAULT_ANTHROPIC_CLIENT_ID="${ANTHROPIC_CLIENT_ID:-9d1c250a-e61b-44d9-88ed-5944
 
 export PATH="${HOME}/.opencode/bin:${HOME}/.local/bin:${HOME}/.nvm/versions/node/current/bin:${HOME}/.nvm/current/bin:${PATH}"
 
+CURL="curl -fsSL --connect-timeout 10 --max-time 120"
+
 print_step() {
     local num="$1"
     local title="$2"
@@ -68,6 +70,7 @@ print_prereq_help() {
     echo "4. Add the Anthropic auth plugin to ${OPENCODE_CONFIG}:"
     echo ""
     echo '     {'
+    echo '       "$schema": "https://opencode.ai/config.json",'
     echo '       "plugin": ["opencode-claude-auth@latest"]'
     echo '     }'
     echo ""
@@ -96,7 +99,7 @@ install_opencode() {
         exit 1
     fi
     info "Installing OpenCode ..."
-    curl -fsSL https://opencode.ai/install | bash
+    $CURL https://opencode.ai/install | bash
     export PATH="${HOME}/.opencode/bin:${HOME}/.local/bin:${PATH}"
     if ! command -v opencode >/dev/null 2>&1; then
         error "OpenCode was installed but is not on PATH in this shell."
@@ -104,7 +107,7 @@ install_opencode() {
         error "  export PATH=\"${HOME}/.opencode/bin:\${HOME}/.local/bin:\${PATH}\""
         exit 1
     fi
-    success "OpenCode installed."
+    success "OpenCode installed: $(opencode --version 2>/dev/null | head -n1 || echo opencode)"
 }
 
 install_node_via_nvm() {
@@ -113,7 +116,7 @@ install_node_via_nvm() {
     fi
     info "Node.js / npm not found. Installing via nvm ..."
     if [[ ! -d "$HOME/.nvm" ]]; then
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+        $CURL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
     fi
     export NVM_DIR="$HOME/.nvm"
     # shellcheck disable=SC1091
@@ -126,7 +129,7 @@ install_node_via_nvm() {
         error "npm installation via nvm failed."
         return 1
     fi
-    success "Node.js / npm installed."
+    success "Node.js / npm installed: $(node --version) / $(npm --version)"
 }
 
 install_claude_cli() {
@@ -147,7 +150,11 @@ install_claude_cli() {
     fi
 
     info "Installing Claude Code CLI via npm ..."
-    npm install -g @anthropic-ai/claude-code
+    npm install -g @anthropic-ai/claude-code || {
+        error "npm install of Claude Code CLI failed."
+        error "Try manually: npm install -g @anthropic-ai/claude-code"
+        exit 1
+    }
     export PATH="${HOME}/.local/bin:${PATH}"
     if ! command -v claude >/dev/null 2>&1; then
         error "Claude Code CLI was installed but is not on PATH in this shell."
@@ -155,7 +162,7 @@ install_claude_cli() {
         error "  export PATH=\"${HOME}/.local/bin:\${HOME}/.nvm/versions/node/current/bin:\${PATH}\""
         exit 1
     fi
-    success "Claude Code CLI installed."
+    success "Claude Code CLI installed: $(claude --version 2>/dev/null | head -n1 || echo claude)"
 }
 
 claude_session_exists() {
@@ -166,7 +173,8 @@ import json, sys
 try:
     with open("$DEFAULT_CLAUDE_CREDENTIALS") as f:
         d = json.load(f)
-    if (d.get("claudeAiOauth") or {}).get("accessToken"):
+    oauth = d.get("claudeAiOauth") or {}
+    if oauth.get("accessToken") and oauth.get("expiresAt", 0) > 0:
         sys.exit(0)
 except Exception:
     pass
@@ -181,6 +189,27 @@ PY
         fi
     fi
     return 1
+}
+
+claude_credentials_are_readable() {
+    if [[ -f "$DEFAULT_CLAUDE_CREDENTIALS" ]]; then
+        python3 - <<PY
+import json, sys, os
+try:
+    with open("$DEFAULT_CLAUDE_CREDENTIALS") as f:
+        d = json.load(f)
+    oauth = d.get("claudeAiOauth") or {}
+    if oauth.get("accessToken"):
+        mode = oct(os.stat("$DEFAULT_CLAUDE_CREDENTIALS").st_mode)[-3:]
+        if mode != "600":
+            print(f"Credentials file has permissions {mode}; setting 600.")
+            os.chmod("$DEFAULT_CLAUDE_CREDENTIALS", 0o600)
+        sys.exit(0)
+except Exception as e:
+    print(f"Warning: could not read credentials file: {e}", file=sys.stderr)
+sys.exit(1)
+PY
+    fi
 }
 
 opencode_anthropic_auth_exists() {
@@ -220,9 +249,7 @@ import json, re, sys, os
 path = os.path.expanduser("$config_path")
 
 def strip_jsonc_comments(src):
-    # Remove // comments
     src = re.sub(r'//[^\n]*', '', src)
-    # Remove /* */ comments (non-greedy)
     src = re.sub(r'/\*.*?\*/', '', src, flags=re.DOTALL)
     return src
 
@@ -243,7 +270,6 @@ if not isinstance(plugins, list):
 if not any("opencode-claude-auth" in p for p in plugins):
     plugins.append("opencode-claude-auth@latest")
     data["plugin"] = plugins
-    # Preserve any $schema key if present
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -298,6 +324,7 @@ check_opencode_prerequisites() {
     print_step 3 "Log in with Claude Code (claude)"
     if claude_session_exists; then
         success "A Claude Code session was detected."
+        claude_credentials_are_readable || true
     else
         warn "No Claude Code session was detected. The installer can run 'claude' for you now."
         warn "If you skip this, the installer will exit and you can re-run it later."
@@ -457,7 +484,10 @@ if [[ ! -d ".venv" ]]; then
 fi
 
 info "Installing Python dependencies ..."
-.venv/bin/pip install -q -r requirements.txt
+.venv/bin/pip install -q -r requirements.txt || {
+    error "Failed to install Python dependencies."
+    exit 1
+}
 success "Dependencies installed."
 
 # ---------------------------------------------------------------------------

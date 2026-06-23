@@ -193,13 +193,14 @@ Keychain → "Claude Code-credentials"       (macOS primary source)
 |-------------|---------|
 | **Python** | 3.9 or newer |
 | **OS** | Linux (systemd recommended) or macOS |
+| **Node.js + npm** | Required to install Claude Code CLI (installer can install via nvm) |
 | **OpenCode CLI** | Installed (`curl -fsSL https://opencode.ai/install \| bash`) |
 | **Claude Code CLI** | Installed and logged in (`claude`) |
 | **Anthropic auth plugin** | `opencode-claude-auth` configured in `~/.config/opencode/opencode.jsonc` |
 | **OpenCode auth** | `opencode auth login` completed with Anthropic |
 | **Credential files** | `~/.local/share/opencode/auth.json` with an `anthropic` entry |
 
-If any prerequisite is missing, the installer stops and tells you exactly what to do.
+If any prerequisite is missing, the installer stops and tells you exactly what to do. The installer can automatically install Node.js via `nvm` if `npm` is missing.
 
 ---
 
@@ -248,6 +249,20 @@ You can pass a different provider name if you already have other OAuth plugins:
 ./scripts/add-to-hermes.sh claude-opus-4-1 my-anthropic
 ```
 
+The script validates that:
+
+- `.env` exists and contains `PORT`.
+- The bridge Python venv exists.
+- Hermes is installed.
+- The generated YAML is syntactically valid.
+- A backup of your existing config is created before editing.
+
+If the provider already exists, it will ask you to use `--force` to overwrite:
+
+```bash
+./scripts/add-to-hermes.sh --force
+```
+
 It creates a **named custom provider** in `~/.hermes/config.yaml` so it does not collide with other `custom` endpoints:
 
 ```yaml
@@ -284,6 +299,19 @@ You can pass a different provider name and model if you already have other OAuth
 
 ```bash
 ./scripts/add-to-openclaw.sh claude-opus-4-1 my-anthropic
+```
+
+The script validates that:
+
+- `.env` exists and contains `PORT`.
+- `python3` is available.
+- The generated JSON is syntactically valid.
+- A backup of your existing config is created before editing.
+
+If the provider already exists, use `--force` to overwrite:
+
+```bash
+./scripts/add-to-openclaw.sh --force
 ```
 
 It edits `~/.openclaw/openclaw.json` (creating it if necessary) and adds the bridge as a custom provider:
@@ -441,6 +469,9 @@ curl -s "$BASE/v1/chat/completions" \
 | Models list is empty | The bridge could not refresh the Anthropic token. Check `bridge.log` and verify the credential files are valid. |
 | Service fails to start | Run the bridge manually to see the error: `source .env && .venv/bin/python3 server.py` |
 | `OAuth refresh error: invalid_grant` | Your refresh token was revoked. Re-run `claude` to log in again, then `opencode auth login`. |
+| `Provider already exists` in `add-to-hermes.sh` / `add-to-openclaw.sh` | The script protects your config from accidental overwrites. | Run the script with `--force` or choose a different provider name. |
+| `Hermes config is not valid YAML` | The script detected a YAML syntax problem after editing. | A backup was created; restore it and report the issue. |
+| `OpenClaw config is not valid JSON` | The script detected a JSON syntax problem after editing. | A backup was created; restore it and report the issue. |
 
 ---
 
