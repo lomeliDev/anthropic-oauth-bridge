@@ -1,0 +1,20 @@
+[Unit]
+Description=Anthropic OAuth -> OpenAI bridge
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%WORK_DIR%
+Environment="PATH=%PYTHON_BIN_DIR%:/usr/local/bin:/usr/bin:/bin"
+Environment="PORT=%PORT%"
+Environment="BRIDGE_API_KEY=%BRIDGE_API_KEY%"
+Environment="ANTHROPIC_AUTH_PATH=%ANTHROPIC_AUTH_PATH%"
+Environment="CLAUDE_CREDENTIALS_PATH=%CLAUDE_CREDENTIALS_PATH%"
+Environment="ANTHROPIC_CLIENT_ID=%ANTHROPIC_CLIENT_ID%"
+ExecStart=%PYTHON_BIN_DIR%/python3 %WORK_DIR%/server.py --host 0.0.0.0 --port %PORT%
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
