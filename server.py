@@ -202,7 +202,14 @@ _MODEL_CACHE_TTL: float = 300.0
 
 
 def _anthropic_headers(extra_beta: list[str] | None = None) -> dict[str, str]:
-    beta = ["claude-code-20250219", "oauth-2025-04-20"]
+    # Base betas mirror the official opencode-claude-auth plugin as closely as possible.
+    beta = [
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+        "prompt-caching-scope-2026-01-05",
+        "context-management-2025-06-27",
+        "advisor-tool-2026-03-01",
+    ]
     if extra_beta:
         beta.extend(extra_beta)
     return {
@@ -213,6 +220,7 @@ def _anthropic_headers(extra_beta: list[str] | None = None) -> dict[str, str]:
         "anthropic-dangerous-direct-browser-access": "true",
         "x-app": "cli",
         "user-agent": "claude-cli/2.1.112 (external, sdk-cli)",
+        "x-client-request-id": str(uuid.uuid4()),
     }
 
 
@@ -327,6 +335,191 @@ def _oai_tool_choice_to_anthropic(tool_choice: Any) -> dict[str, Any] | None:
     return {"type": "auto"}
 
 
+# ============================================================
+# JSON Schema sanitisation for Claude Tool Use
+# ============================================================
+# Anthropic requires JSON Schema Draft 2020-12 but only accepts a subset.
+# This function strips / rewrites keywords that the upstream rejects.
+# See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+_UNSUPPORTED_SCHEMA_KEYS: set[str] = {
+    "$schema", "$id", "$anchor", "$comment", "$defs", "definitions",
+    "title", "default", "examples",
+    "readOnly", "writeOnly", "deprecated",
+    "minLength", "maxLength",
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minItems", "maxItems", "uniqueItems",
+    "minProperties", "maxProperties",
+    "patternProperties", "propertyNames", "additionalProperties",
+    "dependentRequired", "dependentSchemas", "if", "then", "else", "not",
+    "const", "discriminator",
+}
+
+# `format` is only useful for a very small allow-list; otherwise remove it.
+_ALLOWED_STRING_FORMATS: set[str] = {"date", "date-time", "email", "uri", "uuid"}
+
+# Constraints that can be moved into the property description so the model still
+# sees them as soft guidance.
+_DESCRIPTION_CONSTRAINTS: tuple[tuple[str, str], ...] = (
+    ("minLength", "at least {v} characters"),
+    ("maxLength", "at most {v} characters"),
+    ("minimum", "at least {v}"),
+    ("maximum", "at most {v}"),
+    ("exclusiveMinimum", "greater than {v}"),
+    ("exclusiveMaximum", "less than {v}"),
+    ("multipleOf", "multiple of {v}"),
+    ("minItems", "at least {v} items"),
+    ("maxItems", "at most {v} items"),
+    ("minProperties", "at least {v} properties"),
+    ("maxProperties", "at most {v} properties"),
+    ("pattern", "must match pattern {v}"),
+)
+
+
+def _append_constraint_description(original: str, schema: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, template in _DESCRIPTION_CONSTRAINTS:
+        if key in schema:
+            parts.append(template.format(v=schema[key]))
+    if not parts:
+        return original
+    suffix = "; ".join(parts)
+    if original:
+        return f"{original} ({suffix})"
+    return suffix
+
+
+def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
+    """Recursively sanitize a JSON Schema so Anthropic accepts it as input_schema."""
+    if not isinstance(schema, dict):
+        return schema
+
+    # Start from a clean dict with allowed keys only.
+    out: dict[str, Any] = {}
+
+    # Preserve type first so we can reason about the node.
+    t = schema.get("type")
+    if isinstance(t, list):
+        # nullable expressed as type array, e.g. ["string", "null"]
+        non_null = [x for x in t if x != "null"]
+        if len(non_null) == 1:
+            out["type"] = non_null[0]
+        elif len(non_null) > 1:
+            # Claude does not support multi-type unions. Convert to anyOf.
+            out["anyOf"] = [{"type": x} for x in non_null]
+        # "null" alone is dropped and we leave it object-ish by not setting type.
+    elif t is not None:
+        out["type"] = t
+
+    # Keep description, but append numeric/string constraints to it so the model
+    # still has a chance to respect them.
+    desc = schema.get("description", "") if isinstance(schema.get("description"), str) else ""
+    desc = _append_constraint_description(desc, schema)
+    if desc:
+        out["description"] = desc
+
+    # Properties
+    if "properties" in schema and isinstance(schema["properties"], dict):
+        out["properties"] = {
+            k: _sanitize_schema_for_claude(v, in_property=True)
+            for k, v in schema["properties"].items()
+        }
+
+    # Required list: remove duplicates and invalid entries.
+    if "required" in schema and isinstance(schema["required"], list):
+        seen = set()
+        clean_required: list[str] = []
+        for r in schema["required"]:
+            if isinstance(r, str) and r and r not in seen:
+                seen.add(r)
+                clean_required.append(r)
+        if clean_required:
+            out["required"] = clean_required
+
+    # Items
+    if "items" in schema:
+        if isinstance(schema["items"], dict):
+            out["items"] = _sanitize_schema_for_claude(schema["items"], in_property=True)
+        elif isinstance(schema["items"], list):
+            # tuple-style items are not supported in 2020-12 the same way;
+            # collapse to a single anyOf of the tuple items.
+            out["items"] = {"anyOf": [_sanitize_schema_for_claude(x, in_property=True) for x in schema["items"]]}
+
+    # Enum
+    if "enum" in schema and isinstance(schema["enum"], list):
+        out["enum"] = schema["enum"]
+
+    # Format: only keep allowed ones.
+    fmt = schema.get("format")
+    if isinstance(fmt, str) and fmt in _ALLOWED_STRING_FORMATS:
+        out["format"] = fmt
+
+    # Combinators: keep anyOf (Claude supports it inside properties), but drop
+    # oneOf/allOf at the top level and rewrite nested ones to anyOf where possible.
+    if "anyOf" in schema and isinstance(schema["anyOf"], list):
+        sanitized_any = [_sanitize_schema_for_claude(x, in_property=True) for x in schema["anyOf"] if isinstance(x, dict)]
+        if sanitized_any:
+            # If every branch is just a type, collapse to type array if possible.
+            if all(len(b) == 1 and "type" in b for b in sanitized_any):
+                types = [b["type"] for b in sanitized_any]
+                if len(types) == 1:
+                    out["type"] = types[0]
+                else:
+                    out["type"] = types
+            else:
+                out["anyOf"] = sanitized_any
+
+    # oneOf -> anyOf (best effort). We do not support discriminator here.
+    if "oneOf" in schema and isinstance(schema["oneOf"], list):
+        sanitized_one = [_sanitize_schema_for_claude(x, in_property=True) for x in schema["oneOf"] if isinstance(x, dict)]
+        if sanitized_one:
+            if "anyOf" in out:
+                out["anyOf"].extend(sanitized_one)
+            else:
+                out["anyOf"] = sanitized_one
+
+    # allOf -> merge properties/required from all branches (best effort).
+    if "allOf" in schema and isinstance(schema["allOf"], list):
+        merged_props: dict[str, Any] = {}
+        merged_required: list[str] = []
+        for branch in schema["allOf"]:
+            if not isinstance(branch, dict):
+                continue
+            clean_branch = _sanitize_schema_for_claude(branch, in_property=True)
+            if isinstance(clean_branch.get("properties"), dict):
+                merged_props.update(clean_branch["properties"])
+            if isinstance(clean_branch.get("required"), list):
+                merged_required.extend(clean_branch["required"])
+        if merged_props:
+            out.setdefault("properties", {}).update(merged_props)
+        if merged_required:
+            out.setdefault("required", []).extend(merged_required)
+
+    # $ref: if it is a local fragment, try to inline it from $defs/definitions.
+    if "$ref" in schema and isinstance(schema["$ref"], str):
+        ref = schema["$ref"]
+        if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
+            key = ref.split("/")[-1]
+            defs = schema.get("$defs") or schema.get("definitions") or {}
+            if isinstance(defs, dict) and key in defs:
+                inlined = _sanitize_schema_for_claude(defs[key], in_property=True)
+                out.update(inlined)
+        # External refs are unsupported; we drop them.
+
+    # Ensure objects have a properties key so Claude does not complain.
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+
+    # Remove unsupported keys that may have slipped through.
+    for bad in _UNSUPPORTED_SCHEMA_KEYS:
+        out.pop(bad, None)
+
+    # If the node became empty (e.g. only had unsupported keys), default to object.
+    if not out:
+        return {"type": "object", "properties": {}}
+
+    return out
+
+
 def _oai_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for tool in tools:
@@ -338,10 +531,11 @@ def _oai_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         name = fn.get("name")
         if not name:
             continue
+        parameters = fn.get("parameters") or {"type": "object", "properties": {}}
         out.append({
             "name": name,
             "description": fn.get("description", ""),
-            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            "input_schema": _sanitize_schema_for_claude(parameters),
         })
     return out
 
@@ -473,7 +667,7 @@ def _build_anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
             req.setdefault("tools", []).append({
                 "name": "json_object_response",
                 "description": "Respond with a JSON object.",
-                "input_schema": schema,
+                "input_schema": _sanitize_schema_for_claude(schema),
             })
             req["tool_choice"] = {"type": "tool", "name": "json_object_response"}
         elif rf_type == "json_schema":
@@ -481,7 +675,7 @@ def _build_anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
             req.setdefault("tools", []).append({
                 "name": "json_schema_response",
                 "description": "Respond matching the requested JSON schema.",
-                "input_schema": schema,
+                "input_schema": _sanitize_schema_for_claude(schema),
             })
             req["tool_choice"] = {"type": "tool", "name": "json_schema_response"}
 

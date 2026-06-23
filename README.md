@@ -375,6 +375,7 @@ Then in chat:
 - `GET /v1/models` and `GET /v1/models/{id}` (dynamically fetched from Anthropic)
 - `POST /v1/chat/completions` (blocking and SSE streaming)
 - Tools / functions (`tools`, `tool_choice`, multi-turn `role: "tool"`)
+- **Automatic JSON Schema sanitization** for tools and `response_format`, removing Anthropic-rejected keywords (`$schema`, `exclusiveMinimum`, `pattern`, `format`, `minLength`, etc.) and rewriting `oneOf`/`allOf` to `anyOf` or merged properties.
 - Vision (`image_url` with base64 data URI or public http(s) URL)
 - PDF documents (base64)
 - `thinking` parameter for Sonnet/Opus extended thinking
