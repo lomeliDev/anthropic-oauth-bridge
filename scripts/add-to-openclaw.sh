@@ -23,41 +23,6 @@ warn()    { echo -e "${YELLOW}⚠${RESET}  $*"; }
 error()   { echo -e "${RED}✖${RESET}  $*"; }
 
 # ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-FORCE=false
-POSITIONAL=()
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -f|--force)
-            FORCE=true
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: $0 [model] [provider-name] [-f|--force]"
-            echo "  model          Default model to use (default: claude-sonnet-4-5)"
-            echo "  provider-name  Name of the custom provider (default: anthropic-oauth-bridge)"
-            echo "  -f, --force    Overwrite an existing provider entry without asking"
-            exit 0
-            ;;
-        -*)
-            error "Unknown option: $1"
-            exit 1
-            ;;
-        *)
-            POSITIONAL+=("$1")
-            shift
-            ;;
-    esac
-done
-
-set -- "${POSITIONAL[@]}"
-
-DEFAULT_MODEL="${1:-claude-sonnet-4-5}"
-PROVIDER_NAME="${2:-anthropic-oauth-bridge}"
-
-# ---------------------------------------------------------------------------
 # Pre-flight validations
 # ---------------------------------------------------------------------------
 if [[ ! -f ".env" ]]; then
@@ -76,6 +41,51 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     error "python3 is required to edit OpenClaw config."
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Ensure the bridge has an API key. If .env does not have one, generate it
+# automatically so clients like OpenClaw can authenticate.
+# ---------------------------------------------------------------------------
+if [[ -z "${BRIDGE_API_KEY:-}" ]]; then
+    warn "No BRIDGE_API_KEY found in .env. Generating one ..."
+    NEW_KEY=$(openssl rand -hex 24 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(24))")
+    echo "BRIDGE_API_KEY=${NEW_KEY}" >> .env
+    chmod 600 .env
+    BRIDGE_API_KEY="${NEW_KEY}"
+    success "API key saved to .env."
+
+    info "Restarting bridge service to pick up the new API key ..."
+    if systemctl restart anthropic-oauth-bridge 2>/dev/null; then
+        success "Bridge service restarted."
+    else
+        warn "Could not restart anthropic-oauth-bridge via systemctl."
+        warn "If the bridge is already running, you may need to restart it manually."
+    fi
+    sleep 2
+fi
+
+# ---------------------------------------------------------------------------
+# Interactive prompts
+# ---------------------------------------------------------------------------
+ask_with_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local input
+    read -rp "${prompt} [${default_value}]: " input
+    echo "${input:-$default_value}"
+}
+
+if [[ $# -ge 1 ]]; then
+    DEFAULT_MODEL="$1"
+else
+    DEFAULT_MODEL=$(ask_with_default "Model id" "claude-sonnet-4-5")
+fi
+
+if [[ $# -ge 2 ]]; then
+    PROVIDER_NAME="$2"
+else
+    PROVIDER_NAME=$(ask_with_default "Provider name" "anthropic-oauth-bridge")
 fi
 
 CONFIG_DIR="${HOME}/.openclaw"
@@ -102,11 +112,11 @@ echo "  Base URL: ${BASE_URL}"
 echo "  Model:    ${DEFAULT_MODEL}"
 echo ""
 
+mkdir -p "$CONFIG_DIR"
+
 # ---------------------------------------------------------------------------
 # Read and modify config
 # ---------------------------------------------------------------------------
-mkdir -p "$CONFIG_DIR"
-
 python3 - <<PY
 import json
 import os
@@ -118,7 +128,6 @@ provider_name = "${PROVIDER_NAME}"
 base_url = "${BASE_URL}"
 api_key = """${BRIDGE_API_KEY:-}""".strip()
 model = "${DEFAULT_MODEL}"
-force = "${FORCE}".lower() in ("true", "1", "yes")
 
 try:
     data = {}
@@ -133,10 +142,8 @@ models = data.setdefault("models", {})
 models.setdefault("mode", "merge")
 providers = models.setdefault("providers", {})
 
-if provider_name in providers and not force:
-    print(f"Provider '{provider_name}' already exists in OpenClaw config.")
-    print("Use --force to overwrite, or choose a different provider name.")
-    sys.exit(2)
+if provider_name in providers:
+    print(f"Provider '{provider_name}' already exists; overwriting.")
 
 provider = {
     "baseUrl": base_url,
@@ -186,19 +193,46 @@ print("Updated", path)
 PY
 
 status=$?
-if [[ $status -eq 2 ]]; then
-    echo ""
-    warn "Provider '${PROVIDER_NAME}' already exists. Run with --force to overwrite."
-    exit 0
-elif [[ $status -ne 0 ]]; then
+if [[ $status -ne 0 ]]; then
     exit $status
 fi
 
 echo ""
 success "OpenClaw provider '${PROVIDER_NAME}' is configured."
 echo ""
-echo "Apply the config and restart the gateway:"
-echo "  openclaw gateway config.apply --file ${CONFIG_PATH}"
+
+# ---------------------------------------------------------------------------
+# Apply config and restart OpenClaw gateway
+# ---------------------------------------------------------------------------
+echo ""
+read -rp "Apply OpenClaw config and restart the gateway now? [Y/n]: " RESTART_ANSWER
+RESTART_ANSWER="${RESTART_ANSWER:-Y}"
+if [[ "$RESTART_ANSWER" =~ ^[Yy]$ ]]; then
+    echo ""
+    info "OpenClaw gateway status BEFORE restart:"
+    systemctl status openclaw-gateway --no-pager 2>/dev/null || true
+
+    echo ""
+    info "Applying OpenClaw config ..."
+    openclaw gateway config.apply --file "${CONFIG_PATH}" || true
+
+    echo ""
+    info "Restarting OpenClaw gateway ..."
+    if systemctl restart openclaw-gateway 2>/dev/null; then
+        success "OpenClaw gateway restarted."
+    else
+        warn "Could not restart 'openclaw-gateway' via systemctl."
+        warn "Please restart it manually with your OpenClaw management command."
+    fi
+
+    echo ""
+    info "OpenClaw gateway status AFTER restart:"
+    systemctl status openclaw-gateway --no-pager 2>/dev/null || true
+else
+    info "Skipped OpenClaw gateway restart. Apply the config manually with:"
+    echo "  openclaw gateway config.apply --file ${CONFIG_PATH}"
+fi
+
 echo ""
 echo "Then select the model in chat:"
 echo "  /model ${DEFAULT_MODEL}"

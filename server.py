@@ -407,6 +407,65 @@ def _resolve_local_ref(ref: str, registry: dict[str, Any]) -> dict[str, Any] | N
     return None
 
 
+def _convert_const_to_enum(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert { const: x } -> { enum: [x] } so the value is not lost."""
+    if "const" in schema and "enum" not in schema:
+        schema = dict(schema)
+        schema["enum"] = [schema.pop("const")]
+    return schema
+
+
+def _flatten_anyof_oneof(schema: dict[str, Any]) -> dict[str, Any]:
+    """Detect const/enum-of-consts or nullable type unions in anyOf/oneOf."""
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        if not isinstance(branches, list) or not branches:
+            continue
+
+        # Pattern: [{const: a}, {const: b}, ...] -> enum: [a, b]
+        consts: list[Any] = []
+        for b in branches:
+            if isinstance(b, dict) and "const" in b:
+                consts.append(b["const"])
+            elif isinstance(b, dict) and isinstance(b.get("enum"), list) and len(b["enum"]) == 1:
+                consts.append(b["enum"][0])
+        if consts and len(consts) == len(branches):
+            schema = dict(schema)
+            schema.pop(key)
+            schema["enum"] = consts
+            return schema
+
+        # Pattern: [{type: "string"}, {type: "null"}] -> type: "string" + nullable hint
+        types = [
+            b["type"]
+            for b in branches
+            if isinstance(b, dict) and isinstance(b.get("type"), str)
+        ]
+        if types and len(types) == len(branches) and "null" in types:
+            schema = dict(schema)
+            schema.pop(key)
+            non_null = [t for t in types if t != "null"]
+            if len(non_null) == 1:
+                schema["type"] = non_null[0]
+            elif len(non_null) > 1:
+                schema["type"] = non_null[0]
+                schema = _add_description_hint(schema, f"types: {', '.join(non_null)}")
+            schema = _add_description_hint(schema, "nullable")
+            return schema
+
+    return schema
+
+
+def _add_description_hint(schema: dict[str, Any], hint: str) -> dict[str, Any]:
+    """Append an informational hint to a schema's description field."""
+    existing = schema.get("description", "")
+    if isinstance(existing, str) and existing:
+        schema["description"] = f"{existing} ({hint})"
+    else:
+        schema["description"] = hint
+    return schema
+
+
 def _sanitize_schema_for_claude(
     schema: Any,
     in_property: bool = False,
@@ -427,6 +486,11 @@ def _sanitize_schema_for_claude(
     if _refs_stack is None:
         _refs_stack = set()
 
+    # Unwrap a nested 'schema' key if it is the only schema content.
+    if "schema" in schema and isinstance(schema["schema"], dict):
+        schema = dict(schema)
+        schema = schema["schema"]
+
     # Resolve $ref first, so the rest of the function operates on the inlined target.
     ref = schema.get("$ref")
     if isinstance(ref, str):
@@ -443,6 +507,10 @@ def _sanitize_schema_for_claude(
             return inlined
         # External or unresolvable refs: fall through to an open object.
         return {"type": "object", "properties": {}}
+
+    # Structural normalizations before recursive cleaning.
+    schema = _convert_const_to_enum(schema)
+    schema = _flatten_anyof_oneof(schema)
 
     # Start from a clean dict with allowed keys only.
     out: dict[str, Any] = {}

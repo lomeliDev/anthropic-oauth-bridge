@@ -243,25 +243,24 @@ chmod +x scripts/add-to-hermes.sh
 ./scripts/add-to-hermes.sh
 ```
 
-You can pass a different provider name if you already have other OAuth plugins:
+The script will ask for the model and provider name, or you can pass them as arguments:
 
 ```bash
 ./scripts/add-to-hermes.sh claude-opus-4-1 my-anthropic
 ```
 
-The script validates that:
+What it does:
 
-- `.env` exists and contains `PORT`.
-- The bridge Python venv exists.
-- Hermes is installed.
-- The generated YAML is syntactically valid.
-- A backup of your existing config is created before editing.
+- Validates `.env`, `PORT`, the bridge venv, and Hermes installation.
+- **Generates a bridge API key automatically** if you did not set one, and restarts the bridge service.
+- Registers a **named provider** in the top-level `providers` map of `~/.hermes/config.yaml` (Hermes' preferred format).
+- Keeps `custom_providers` in sync for older Hermes versions.
+- Optionally sets the provider as active.
+- Removes stale `model.base_url` / `model.api_key` entries that could point to OpenRouter.
+- Creates a backup of your config and validates the generated YAML.
+- Optionally restarts the Hermes gateway and shows status before/after.
 
-If the provider already exists, it will ask you to use `--force` to overwrite:
-
-```bash
-./scripts/add-to-hermes.sh --force
-```
+> **Note:** If you see a warning about `model.base_url` still pointing to OpenRouter, the script could not clean it automatically. Edit `~/.hermes/config.yaml` and remove `model.base_url` / `model.api_key` so Hermes uses your named provider.
 
 It creates a **named custom provider** in `~/.hermes/config.yaml` so it does not collide with other `custom` endpoints:
 
@@ -295,24 +294,19 @@ chmod +x scripts/add-to-openclaw.sh
 ./scripts/add-to-openclaw.sh
 ```
 
-You can pass a different provider name and model if you already have other OAuth plugins:
+The script will ask for the model and provider name, or you can pass them as arguments:
 
 ```bash
 ./scripts/add-to-openclaw.sh claude-opus-4-1 my-anthropic
 ```
 
-The script validates that:
+What it does:
 
-- `.env` exists and contains `PORT`.
-- `python3` is available.
-- The generated JSON is syntactically valid.
-- A backup of your existing config is created before editing.
-
-If the provider already exists, use `--force` to overwrite:
-
-```bash
-./scripts/add-to-openclaw.sh --force
-```
+- Validates `.env`, `PORT`, and `python3`.
+- **Generates a bridge API key automatically** if you did not set one, and restarts the bridge service.
+- Edits `~/.openclaw/openclaw.json` (creating it if necessary) and adds the bridge as a custom provider.
+- Creates a backup of your config and validates the generated JSON.
+- Optionally applies the config with `openclaw gateway config.apply`, restarts the OpenClaw gateway, and shows status before/after.
 
 It edits `~/.openclaw/openclaw.json` (creating it if necessary) and adds the bridge as a custom provider:
 

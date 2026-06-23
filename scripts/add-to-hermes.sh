@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Add the local Anthropic OAuth Bridge as a named custom OpenAI-compatible provider in Hermes.
+# Add the local Anthropic OAuth Bridge as a named OpenAI-compatible provider in Hermes.
 #
 set -euo pipefail
 
@@ -21,41 +21,6 @@ info()    { echo -e "${CYAN}ℹ${RESET}  $*"; }
 success() { echo -e "${GREEN}✔${RESET}  $*"; }
 warn()    { echo -e "${YELLOW}⚠${RESET}  $*"; }
 error()   { echo -e "${RED}✖${RESET}  $*"; }
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-FORCE=false
-POSITIONAL=()
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -f|--force)
-            FORCE=true
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: $0 [model] [provider-name] [-f|--force]"
-            echo "  model          Default model to use (default: claude-sonnet-4-5)"
-            echo "  provider-name  Name of the custom provider (default: anthropic-oauth-bridge)"
-            echo "  -f, --force    Overwrite an existing provider entry without asking"
-            exit 0
-            ;;
-        -*)
-            error "Unknown option: $1"
-            exit 1
-            ;;
-        *)
-            POSITIONAL+=("$1")
-            shift
-            ;;
-    esac
-done
-
-set -- "${POSITIONAL[@]}"
-
-DEFAULT_MODEL="${1:-claude-sonnet-4-5}"
-PROVIDER_NAME="${2:-anthropic-oauth-bridge}"
 
 # ---------------------------------------------------------------------------
 # Pre-flight validations
@@ -92,7 +57,51 @@ if ! command -v hermes >/dev/null 2>&1; then
     exit 1
 fi
 
-HERMES_CONFIG="${HERMES_HOME:-${HOME}/.hermes}/config.yaml"
+# ---------------------------------------------------------------------------
+# Ensure the bridge has an API key. If .env does not have one, generate it
+# automatically so clients like Hermes can authenticate.
+# ---------------------------------------------------------------------------
+if [[ -z "${BRIDGE_API_KEY:-}" ]]; then
+    warn "No BRIDGE_API_KEY found in .env. Generating one ..."
+    NEW_KEY=$(openssl rand -hex 24 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(24))")
+    echo "BRIDGE_API_KEY=${NEW_KEY}" >> .env
+    chmod 600 .env
+    BRIDGE_API_KEY="${NEW_KEY}"
+    success "API key saved to .env."
+
+    info "Restarting bridge service to pick up the new API key ..."
+    if systemctl restart anthropic-oauth-bridge 2>/dev/null; then
+        success "Bridge service restarted."
+    else
+        warn "Could not restart anthropic-oauth-bridge via systemctl."
+        warn "If the bridge is already running, you may need to restart it manually."
+    fi
+    sleep 2
+fi
+
+# ---------------------------------------------------------------------------
+# Interactive prompts
+# ---------------------------------------------------------------------------
+ask_with_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local input
+    read -rp "${prompt} [${default_value}]: " input
+    echo "${input:-$default_value}"
+}
+
+if [[ $# -ge 1 ]]; then
+    DEFAULT_MODEL="$1"
+else
+    DEFAULT_MODEL=$(ask_with_default "Model id" "claude-sonnet-4-5")
+fi
+
+if [[ $# -ge 2 ]]; then
+    PROVIDER_NAME="$2"
+else
+    PROVIDER_NAME=$(ask_with_default "Provider name" "anthropic-oauth-bridge")
+fi
+
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
 echo ""
@@ -101,19 +110,29 @@ echo "────────────────────────�
 echo "  Provider: ${PROVIDER_NAME}"
 echo "  Base URL: ${BASE_URL}"
 echo "  Model:    ${DEFAULT_MODEL}"
-echo "  Config:   ${HERMES_CONFIG}"
+echo "  Config:   ${HERMES_CONFIG:-${HOME}/.hermes/config.yaml}"
 echo ""
 
-# ---------------------------------------------------------------------------
-# Read and modify config
-# ---------------------------------------------------------------------------
+HERMES_CONFIG="${HERMES_HOME:-${HOME}/.hermes}/config.yaml"
 mkdir -p "$(dirname "$HERMES_CONFIG")"
 
+# ---------------------------------------------------------------------------
+# Backup existing config
+# ---------------------------------------------------------------------------
 if [[ -f "$HERMES_CONFIG" ]]; then
     cp "$HERMES_CONFIG" "${HERMES_CONFIG}.backup.$(date +%s)"
     success "Created backup of existing Hermes config."
 fi
 
+# ---------------------------------------------------------------------------
+# Ask whether to set as active provider
+# ---------------------------------------------------------------------------
+read -rp "Set '${PROVIDER_NAME}' as the active Hermes provider? [Y/n]: " SET_ACTIVE
+SET_ACTIVE="${SET_ACTIVE:-Y}"
+
+# ---------------------------------------------------------------------------
+# Read and modify config
+# ---------------------------------------------------------------------------
 "$PYTHON_BIN" - <<PY
 import os
 import sys
@@ -124,7 +143,7 @@ provider_name = "${PROVIDER_NAME}"
 base_url = "${BASE_URL}"
 api_key = """${BRIDGE_API_KEY:-}""".strip()
 model = "${DEFAULT_MODEL}"
-force = "${FORCE}".lower() in ("true", "1", "yes")
+set_active = "${SET_ACTIVE}".lower().startswith("y")
 
 try:
     if os.path.exists(config_path):
@@ -136,32 +155,44 @@ except Exception as e:
     print(f"Error reading Hermes config: {e}", file=sys.stderr)
     sys.exit(1)
 
-custom_providers = data.setdefault("custom_providers", [])
-
-# Check for existing provider
-existing = [p for p in custom_providers if p.get("name") == provider_name]
-if existing and not force:
-    print(f"Provider '{provider_name}' already exists in Hermes config.")
-    print("Use --force to overwrite, or choose a different provider name.")
-    sys.exit(2)
-
-# Remove existing entry with same name
-custom_providers[:] = [p for p in custom_providers if p.get("name") != provider_name]
-
+# Hermes resolves named providers from the top-level 'providers' map.
+providers = data.setdefault("providers", {})
 provider = {
-    "name": provider_name,
     "base_url": base_url,
     "api_mode": "chat_completions",
     "models": [{"id": model, "name": model}],
 }
 if api_key:
     provider["api_key"] = api_key
+providers[provider_name] = provider
 
-custom_providers.append(provider)
+# Keep custom_providers in sync for older Hermes versions.
+custom_providers = data.setdefault("custom_providers", [])
+custom_providers[:] = [p for p in custom_providers if p.get("name") != provider_name]
+custom_providers.append({
+    "name": provider_name,
+    "base_url": base_url,
+    "api_mode": "chat_completions",
+    "models": [{"id": model, "name": model}],
+    **({"api_key": api_key} if api_key else {}),
+})
 
 model_section = data.setdefault("model", {})
-model_section["provider"] = f"custom:{provider_name}"
-model_section["default"] = model
+if set_active:
+    model_section["provider"] = provider_name
+    model_section["default"] = model
+
+# If the active provider points to our named provider, remove any stale
+# global custom base_url/api_key. Hermes sometimes auto-fills OpenRouter's
+# URL here when the provider name is 'custom' or the model is not found.
+if model_section.get("provider") == provider_name:
+    removed = []
+    for key in ("base_url", "api_key"):
+        if key in model_section:
+            del model_section[key]
+            removed.append(key)
+    if removed:
+        print(f"Removed stale model.{', '.join(removed)} so provider '{provider_name}' is used")
 
 try:
     with open(config_path, "w") as f:
@@ -178,21 +209,62 @@ except Exception as e:
     print(f"Generated config is not valid YAML: {e}", file=sys.stderr)
     sys.exit(1)
 
+# Verify the final config and warn about common misconfigurations.
+final_provider = model_section.get("provider")
+final_base_url = model_section.get("base_url", "")
+if final_provider != provider_name:
+    print(f"WARNING: model.provider is '{final_provider}', not '{provider_name}'.")
+if "openrouter" in str(final_base_url).lower():
+    print(f"WARNING: model.base_url still points to OpenRouter ({final_base_url}).")
+    print("         Remove it manually or the bridge will not be used.")
+
 print(f"Updated {config_path}")
 PY
 
 status=$?
-if [[ $status -eq 2 ]]; then
-    echo ""
-    warn "Provider '${PROVIDER_NAME}' already exists. Run with --force to overwrite."
-    exit 0
-elif [[ $status -ne 0 ]]; then
+if [[ $status -ne 0 ]]; then
     exit $status
 fi
 
 echo ""
-success "Hermes is now configured with provider 'custom:${PROVIDER_NAME}'."
+if [[ "${SET_ACTIVE}" =~ ^[Yy] ]]; then
+    success "Hermes is configured to use '${PROVIDER_NAME}' as the active provider."
+    echo "  Model: ${DEFAULT_MODEL}"
+else
+    success "Hermes now knows the provider '${PROVIDER_NAME}'."
+    echo ""
+    echo "To activate it manually, run:"
+    echo "  /model ${PROVIDER_NAME}:${DEFAULT_MODEL}"
+fi
+
+# ---------------------------------------------------------------------------
+# Restart Hermes gateway
+# ---------------------------------------------------------------------------
 echo ""
-echo "Start Hermes and switch models with:"
-echo "  /model custom:${PROVIDER_NAME}:${DEFAULT_MODEL}"
+read -rp "Restart Hermes gateway now? [Y/n]: " RESTART_ANSWER
+RESTART_ANSWER="${RESTART_ANSWER:-Y}"
+if [[ "$RESTART_ANSWER" =~ ^[Yy]$ ]]; then
+    echo ""
+    info "Hermes gateway status BEFORE restart:"
+    systemctl status hermes-gateway --no-pager || true
+
+    echo ""
+    info "Restarting Hermes gateway ..."
+    if systemctl restart hermes-gateway 2>/dev/null; then
+        success "Hermes gateway restarted."
+    else
+        warn "systemctl restart failed, trying 'hermes gateway restart' ..."
+        hermes gateway restart || true
+    fi
+
+    echo ""
+    info "Hermes gateway status AFTER restart:"
+    systemctl status hermes-gateway --no-pager || true
+else
+    info "Skipped Hermes gateway restart. Remember to restart it manually:"
+    echo "  systemctl restart hermes-gateway"
+    echo "  # or"
+    echo "  hermes gateway restart"
+fi
+
 echo ""
