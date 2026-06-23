@@ -388,10 +388,61 @@ def _append_constraint_description(original: str, schema: dict[str, Any]) -> str
     return suffix
 
 
-def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
-    """Recursively sanitize a JSON Schema so Anthropic accepts it as input_schema."""
+def _build_defs_registry(schema: dict[str, Any]) -> dict[str, Any]:
+    """Collect all local definitions from $defs / definitions into a flat registry."""
+    registry: dict[str, Any] = {}
+    for key in ("$defs", "definitions"):
+        if key in schema and isinstance(schema[key], dict):
+            registry.update(schema[key])
+    return registry
+
+
+def _resolve_local_ref(ref: str, registry: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve a local JSON Schema $ref fragment using a flat definitions registry."""
+    if not isinstance(ref, str):
+        return None
+    if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
+        key = ref.split("/")[-1]
+        return registry.get(key)
+    return None
+
+
+def _sanitize_schema_for_claude(
+    schema: Any,
+    in_property: bool = False,
+    defs_registry: dict[str, Any] | None = None,
+    _refs_stack: set[str] | None = None,
+) -> Any:
+    """Recursively sanitize a JSON Schema so Anthropic accepts it as input_schema.
+
+    Handles $ref resolution across nested schemas by carrying a flat registry of
+    $defs/definitions discovered at the root. Cycles are broken by a visited stack.
+    """
     if not isinstance(schema, dict):
         return schema
+
+    # On the top-level call, build the definitions registry from the schema itself.
+    if defs_registry is None:
+        defs_registry = _build_defs_registry(schema)
+    if _refs_stack is None:
+        _refs_stack = set()
+
+    # Resolve $ref first, so the rest of the function operates on the inlined target.
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in _refs_stack:
+            # Cycle detected: replace with an open object to avoid infinite recursion.
+            return {"type": "object", "properties": {}}
+        resolved = _resolve_local_ref(ref, defs_registry)
+        if isinstance(resolved, dict):
+            _refs_stack.add(ref)
+            inlined = _sanitize_schema_for_claude(
+                resolved, in_property=in_property, defs_registry=defs_registry, _refs_stack=_refs_stack
+            )
+            _refs_stack.discard(ref)
+            return inlined
+        # External or unresolvable refs: fall through to an open object.
+        return {"type": "object", "properties": {}}
 
     # Start from a clean dict with allowed keys only.
     out: dict[str, Any] = {}
@@ -399,14 +450,11 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
     # Preserve type first so we can reason about the node.
     t = schema.get("type")
     if isinstance(t, list):
-        # nullable expressed as type array, e.g. ["string", "null"]
         non_null = [x for x in t if x != "null"]
         if len(non_null) == 1:
             out["type"] = non_null[0]
         elif len(non_null) > 1:
-            # Claude does not support multi-type unions. Convert to anyOf.
             out["anyOf"] = [{"type": x} for x in non_null]
-        # "null" alone is dropped and we leave it object-ish by not setting type.
     elif t is not None:
         out["type"] = t
 
@@ -420,7 +468,7 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
     # Properties
     if "properties" in schema and isinstance(schema["properties"], dict):
         out["properties"] = {
-            k: _sanitize_schema_for_claude(v, in_property=True)
+            k: _sanitize_schema_for_claude(v, in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack)
             for k, v in schema["properties"].items()
         }
 
@@ -438,11 +486,16 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
     # Items
     if "items" in schema:
         if isinstance(schema["items"], dict):
-            out["items"] = _sanitize_schema_for_claude(schema["items"], in_property=True)
+            out["items"] = _sanitize_schema_for_claude(
+                schema["items"], in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack
+            )
         elif isinstance(schema["items"], list):
-            # tuple-style items are not supported in 2020-12 the same way;
-            # collapse to a single anyOf of the tuple items.
-            out["items"] = {"anyOf": [_sanitize_schema_for_claude(x, in_property=True) for x in schema["items"]]}
+            out["items"] = {
+                "anyOf": [
+                    _sanitize_schema_for_claude(x, in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack)
+                    for x in schema["items"]
+                ]
+            }
 
     # Enum
     if "enum" in schema and isinstance(schema["enum"], list):
@@ -453,12 +506,13 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
     if isinstance(fmt, str) and fmt in _ALLOWED_STRING_FORMATS:
         out["format"] = fmt
 
-    # Combinators: keep anyOf (Claude supports it inside properties), but drop
-    # oneOf/allOf at the top level and rewrite nested ones to anyOf where possible.
+    # Combinators
     if "anyOf" in schema and isinstance(schema["anyOf"], list):
-        sanitized_any = [_sanitize_schema_for_claude(x, in_property=True) for x in schema["anyOf"] if isinstance(x, dict)]
+        sanitized_any = [
+            _sanitize_schema_for_claude(x, in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack)
+            for x in schema["anyOf"] if isinstance(x, dict)
+        ]
         if sanitized_any:
-            # If every branch is just a type, collapse to type array if possible.
             if all(len(b) == 1 and "type" in b for b in sanitized_any):
                 types = [b["type"] for b in sanitized_any]
                 if len(types) == 1:
@@ -468,23 +522,26 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
             else:
                 out["anyOf"] = sanitized_any
 
-    # oneOf -> anyOf (best effort). We do not support discriminator here.
     if "oneOf" in schema and isinstance(schema["oneOf"], list):
-        sanitized_one = [_sanitize_schema_for_claude(x, in_property=True) for x in schema["oneOf"] if isinstance(x, dict)]
+        sanitized_one = [
+            _sanitize_schema_for_claude(x, in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack)
+            for x in schema["oneOf"] if isinstance(x, dict)
+        ]
         if sanitized_one:
             if "anyOf" in out:
                 out["anyOf"].extend(sanitized_one)
             else:
                 out["anyOf"] = sanitized_one
 
-    # allOf -> merge properties/required from all branches (best effort).
     if "allOf" in schema and isinstance(schema["allOf"], list):
         merged_props: dict[str, Any] = {}
         merged_required: list[str] = []
         for branch in schema["allOf"]:
             if not isinstance(branch, dict):
                 continue
-            clean_branch = _sanitize_schema_for_claude(branch, in_property=True)
+            clean_branch = _sanitize_schema_for_claude(
+                branch, in_property=True, defs_registry=defs_registry, _refs_stack=_refs_stack
+            )
             if isinstance(clean_branch.get("properties"), dict):
                 merged_props.update(clean_branch["properties"])
             if isinstance(clean_branch.get("required"), list):
@@ -494,18 +551,7 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
         if merged_required:
             out.setdefault("required", []).extend(merged_required)
 
-    # $ref: if it is a local fragment, try to inline it from $defs/definitions.
-    if "$ref" in schema and isinstance(schema["$ref"], str):
-        ref = schema["$ref"]
-        if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
-            key = ref.split("/")[-1]
-            defs = schema.get("$defs") or schema.get("definitions") or {}
-            if isinstance(defs, dict) and key in defs:
-                inlined = _sanitize_schema_for_claude(defs[key], in_property=True)
-                out.update(inlined)
-        # External refs are unsupported; we drop them.
-
-    # Ensure objects have a properties key so Claude does not complain.
+    # Ensure objects have a properties key.
     if out.get("type") == "object" and "properties" not in out:
         out["properties"] = {}
 
@@ -513,7 +559,7 @@ def _sanitize_schema_for_claude(schema: Any, in_property: bool = False) -> Any:
     for bad in _UNSUPPORTED_SCHEMA_KEYS:
         out.pop(bad, None)
 
-    # If the node became empty (e.g. only had unsupported keys), default to object.
+    # If the node became empty, default to object.
     if not out:
         return {"type": "object", "properties": {}}
 
