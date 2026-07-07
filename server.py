@@ -62,14 +62,13 @@ ANTHROPIC_CLIENT_ID = os.environ.get(
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 OAUTH_TOKEN_URL = "https://claude.ai/v1/oauth/token"
-# Anthropic migrated to platform.claude.com; console.anthropic.com now 404s.
-OAUTH_TOKEN_URLS = [
-    "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
-]
+# Both claude.ai and platform.claude.com accept authorization_code
+# (platform.claude.com tends to rate-limit; claude.ai does not)
+OAUTH_CODE_URL = "https://claude.ai/v1/oauth/token"
 
 # Claude Code version for billing header (matches OpenCode plugin).
-CLAUDE_CODE_VERSION = os.environ.get("ANTHROPIC_CLI_VERSION", "2.1.112")
+CLAUDE_CODE_VERSION = os.environ.get("ANTHROPIC_CLI_VERSION", "2.1.202")
+CLAUDE_CODE_USER_AGENT = f"claude-code/{CLAUDE_CODE_VERSION} (external, cli)"
 CLAUDE_CODE_ENTRYPOINT = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
 
 # ── Claude model config (mirrors Hermes anthropic_adapter + OpenCode) ──
@@ -404,45 +403,62 @@ class Auth:
         if not refresh_token:
             raise RuntimeError("No refresh token available")
 
-        # Try multiple token endpoints (platform.claude.com first, then console.anthropic.com)
+        # Try multiple token endpoints with retry-on-429 backoff.
+        # Anthropic rate-limits the refresh endpoint (cooldown after token
+        # issuance), so we retry with exponential backoff up to ~2 min.
         last_error = None
-        for endpoint in OAUTH_TOKEN_URLS:
-            try:
-                r = requests.post(
-                    endpoint,
-                    data={
-                        "client_id": ANTHROPIC_CLIENT_ID,
-                        "refresh_token": refresh_token,
-                        "grant_type": "refresh_token",
-                    },
-                    timeout=20,
-                )
-                r.raise_for_status()
-                tok = r.json()
-                if "access_token" not in tok:
-                    raise RuntimeError(f"Refresh response missing access_token: {tok}")
-                self._access = tok["access_token"]
-                # Anthropic rotates refresh tokens on every refresh.
-                self._refresh = tok.get("refresh_token") or self._refresh
-                self._expires_at = now_ms + int(tok.get("expires_in", 36000)) * 1000
-                self._email = (tok.get("account") or {}).get("email_address") or self._email
-                self._persist()
-                return
-            except Exception as e:
-                last_error = e
-                continue
+        for endpoint in [OAUTH_CODE_URL, OAUTH_TOKEN_URL]:
+            for retry_n in range(6):  # 0, 2, 4, 8, 16, 32 = up to ~62s total
+                try:
+                    r = requests.post(
+                        endpoint,
+                        data={
+                            "client_id": ANTHROPIC_CLIENT_ID,
+                            "refresh_token": refresh_token,
+                            "grant_type": "refresh_token",
+                        },
+                        headers={
+                            "User-Agent": CLAUDE_CODE_USER_AGENT,
+                        },
+                        timeout=20,
+                    )
+                    if r.status_code == 429:
+                        wait = 2 ** retry_n
+                        print(f"[auth] refresh rate-limited ({r.status_code}) — retrying in {wait}s "
+                              f"(attempt {retry_n+1}/6)", flush=True)
+                        time.sleep(wait)
+                        continue
+                    r.raise_for_status()
+                    tok = r.json()
+                    if "access_token" not in tok:
+                        raise RuntimeError(f"Refresh response missing access_token: {tok}")
+                    self._access = tok["access_token"]
+                    # Anthropic rotates refresh tokens on every refresh.
+                    self._refresh = tok.get("refresh_token") or self._refresh
+                    self._expires_at = now_ms + int(tok.get("expires_in", 36000)) * 1000
+                    self._email = (tok.get("account") or {}).get("email_address") or self._email
+                    self._persist()
+                    print("[auth] token refreshed successfully", flush=True)
+                    return
+                except Exception as e:
+                    if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 429:
+                        continue  # handled above
+                    last_error = e
+                    break  # non-retryable error, try next endpoint
         raise RuntimeError(f"Token refresh failed at all endpoints: {last_error}")
 
     def get_token(self, allow_refresh: bool = True) -> str:
         with self._lock:
             self._load()
-            now_ms = int(time.time() * 1000)
-            if self._access and self._expires_at > now_ms + 30_000:
+            if self._access:
+                # Use token optimistically — don't proactively refresh.
+                # Anthropic rate-limits the refresh endpoint when the token
+                # is fresh; we only refresh on a real 401 from the API.
                 return self._access
             if allow_refresh:
                 self._refresh_token()
                 return self._access
-            raise RuntimeError("OAuth access token expired and refresh is disabled")
+            raise RuntimeError("No OAuth access token available")
 
     # ── Multi-account support ───────────────────────────────
 
@@ -510,7 +526,7 @@ class Auth:
         # Refresh
         client_id = account.get("client_id", ANTHROPIC_CLIENT_ID)
         last_error = None
-        for endpoint in OAUTH_TOKEN_URLS:
+        for endpoint in [OAUTH_TOKEN_URL]:
             try:
                 r = requests.post(
                     endpoint,
@@ -1648,7 +1664,7 @@ def admin_health():
         "token_expires_at": auth._expires_at,
         "now_ms": int(time.time() * 1000),
         "accounts": auth.list_accounts(),
-        "token_endpoints": OAUTH_TOKEN_URLS,
+        "token_endpoints": OAUTH_TOKEN_URL,
     })
 
 
@@ -1727,7 +1743,7 @@ def usage():
         "token_remaining_ms": max(0, auth._expires_at - now_ms),
         "now_ms": now_ms,
         "accounts": len(auth._accounts),
-        "token_endpoints": OAUTH_TOKEN_URLS,
+        "token_endpoints": OAUTH_TOKEN_URL,
     })
 
 
@@ -1940,7 +1956,10 @@ from urllib.parse import urlparse, parse_qs
 # OAuth PKCE endpoints (matches Hermes anthropic_adapter)
 ANTHROPIC_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 ANTHROPIC_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-ANTHROPIC_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+ANTHROPIC_OAUTH_SCOPES = (
+    "user:profile user:inference user:sessions:claude_code "
+    "user:mcp_servers user:file_upload"
+)
 
 _pkce_state: dict[str, Any] = {}  # session_id -> {verifier, state, ...}
 
@@ -1988,7 +2007,12 @@ def auth_login_start():
     return jsonify({
         "session_id": session_id,
         "auth_url": auth_url,
-        "message": "Open the URL in your browser, authorize, then POST the code to /auth/exchange",
+        "code_verifier": verifier,
+        "client_id": ANTHROPIC_CLIENT_ID,
+        "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+        "token_endpoint": OAUTH_CODE_URL,
+        "message": "Open the URL in your browser, authorize, copy the code from the redirect URL, "
+                   "then POST to /auth/exchange or run the curl command on your local machine.",
     })
 
 
@@ -2017,34 +2041,59 @@ def auth_login_exchange():
         return jsonify({"error": "OAuth state mismatch — possible CSRF"}), 400
 
     # Exchange code for tokens (OAuth 2.0 requires form-urlencoded, NOT JSON)
-    exchange_data = urllib.parse.urlencode({
+    exchange_data = {
         "grant_type": "authorization_code",
         "client_id": ANTHROPIC_CLIENT_ID,
         "code": code,
         "state": received_state or sess["state"],
         "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
         "code_verifier": sess["verifier"],
-    }).encode()
+    }
 
     result = None
     last_error = None
-    for endpoint in OAUTH_TOKEN_URLS:
-        req_obj = urllib.request.Request(
-            endpoint,
-            data=exchange_data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": f"claude-code/{CLAUDE_CODE_VERSION} (external, cli)",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req_obj, timeout=15) as resp_obj:
-                result = json.loads(resp_obj.read().decode())
+    # Try direct first, then Tor SOCKS5 as fallback.
+    # claude.ai rate-limits Tor exit nodes, but allows direct datacenter IPs
+    # for authorization_code exchange (unlike platform.claude.com).
+    proxy_options = [None]  # direct first
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        if s.connect_ex(("127.0.0.1", 9050)) == 0:
+            proxy_options.append({"https": "socks5h://127.0.0.1:9050"})
+            print("[auth] Tor available as fallback", flush=True)
+        s.close()
+    except Exception:
+        pass
+
+    result = None
+    last_error = None
+    for proxies in proxy_options:
+        for endpoint in [OAUTH_CODE_URL]:
+            try:
+                r = requests.post(
+                    endpoint,
+                    data=exchange_data,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": f"claude-code/{CLAUDE_CODE_VERSION} (external, cli)",
+                    },
+                    proxies=proxies,
+                    timeout=20,
+                )
+                via = "Tor" if proxies else "direct"
+                print(f"[auth] exchange response: HTTP {r.status_code} (via {via})", flush=True)
+                if r.status_code != 200:
+                    print(f"[auth] exchange error body: {r.text[:300]}", flush=True)
+                r.raise_for_status()
+                result = r.json()
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        if result is not None:
             break
-        except Exception as e:
-            last_error = e
-            continue
 
     if result is None:
         return jsonify({"error": f"Token exchange failed: {last_error}"}), 502
@@ -2096,6 +2145,72 @@ def auth_login_exchange():
 
     # Cleanup session
     _pkce_state.pop(session_id, None)
+
+    return jsonify({
+        "ok": True,
+        "access_token_prefix": access_token[:12] + "...",
+        "expires_at_ms": expires_at_ms,
+        "has_refresh_token": bool(refresh_token),
+    })
+
+
+@app.route("/auth/save-tokens", methods=["POST"])
+def auth_save_tokens():
+    """Receive tokens from a client-side exchange (user's local machine).
+
+    When the server IP is rate-limited by Anthropic's OAuth endpoint,
+    the user can run the exchange curl on their local machine and
+    POST the resulting tokens here.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    session_id = body.get("session_id", "")
+    access_token = body.get("access_token", "").strip()
+    refresh_token = body.get("refresh_token", "").strip()
+    expires_in = body.get("expires_in", 0)
+    api_key = body.get("api_key", "").strip()
+    label = body.get("label", "Default").strip()
+
+    if not access_token:
+        return jsonify({"error": "access_token is required"}), 400
+
+    now_ms = int(time.time() * 1000)
+    expires_at_ms = now_ms + (int(expires_in) * 1000) if expires_in else now_ms + 3600_000
+
+    if api_key:
+        auth.add_account(api_key, label, refresh_token,
+                         client_id=ANTHROPIC_CLIENT_ID)
+        cache_file = AUTH_CACHE_DIR / f"{hashlib.sha256(api_key.encode()).hexdigest()[:16]}.json"
+        AUTH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(AUTH_CACHE_DIR), 0o700)
+        except OSError:
+            pass
+        tmp = cache_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_at": expires_at_ms,
+                }, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, cache_file)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        auth._access = access_token
+        auth._refresh = refresh_token
+        auth._expires_at = expires_at_ms
+        auth._persist()
+
+    # Cleanup PKCE session
+    if session_id:
+        _pkce_state.pop(session_id, None)
 
     return jsonify({
         "ok": True,

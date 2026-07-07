@@ -1,13 +1,13 @@
 {
   "_comment": "Multi-account configuration for Anthropic OAuth Bridge.",
-  "_docs": "Add accounts via the admin API: POST /admin/accounts",
-  "_docs_curl": "curl -s -X POST http://127.0.0.1:64173/admin/accounts -H 'Content-Type: application/json' -H 'Authorization: Bearer <BRIDGE_ADMIN_KEY>' -d '{\"api_key\":\"sk-example123\",\"label\":\"Personal\",\"refresh_token\":\"1//abc...\",\"email\":\"you@gmail.com\"}'",
+  "_docs": "Add accounts via the built-in PKCE flow: POST /auth/login → authorize in browser → POST /auth/exchange (with api_key). Or manually: POST /auth/save-tokens.",
+  "_docs_flow": "curl -X POST http://127.0.0.1:64173/auth/login | jq    # get auth_url + code_verifier\n# Open auth_url in browser, authorize, copy code from redirect URL\ncurl -X POST http://127.0.0.1:64173/auth/exchange -H 'Content-Type: application/json' -d '{\"session_id\":\"...\",\"code\":\"...\",\"api_key\":\"sk-myaccount\",\"label\":\"My Account\"}'",
   "accounts": {
-    "sk-example-account-1": {
-      "label": "Personal Account",
-      "refresh_token": "1//your-google-oauth-refresh-token-here",
+    "sk-myaccount": {
+      "label": "My Account",
+      "refresh_token": "sk-ant-ort01-...",
       "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-      "email": "you@gmail.com"
+      "email": "you@example.com"
     }
   }
 }
