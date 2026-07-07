@@ -1939,7 +1939,7 @@ from urllib.parse import urlparse, parse_qs
 
 # OAuth PKCE endpoints (matches Hermes anthropic_adapter)
 ANTHROPIC_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-ANTHROPIC_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+ANTHROPIC_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 ANTHROPIC_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 
 _pkce_state: dict[str, Any] = {}  # session_id -> {verifier, state, ...}
@@ -2016,8 +2016,8 @@ def auth_login_exchange():
     if received_state and received_state != sess["state"]:
         return jsonify({"error": "OAuth state mismatch — possible CSRF"}), 400
 
-    # Exchange code for tokens
-    exchange_data = json.dumps({
+    # Exchange code for tokens (OAuth 2.0 requires form-urlencoded, NOT JSON)
+    exchange_data = urllib.parse.urlencode({
         "grant_type": "authorization_code",
         "client_id": ANTHROPIC_CLIENT_ID,
         "code": code,
@@ -2033,7 +2033,7 @@ def auth_login_exchange():
             endpoint,
             data=exchange_data,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": f"claude-code/{CLAUDE_CODE_VERSION} (external, cli)",
             },
             method="POST",
