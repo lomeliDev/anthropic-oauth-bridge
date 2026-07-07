@@ -424,7 +424,7 @@ class Auth:
                 self._access = tok["access_token"]
                 # Anthropic rotates refresh tokens on every refresh.
                 self._refresh = tok.get("refresh_token") or self._refresh
-                self._expires_at = now_ms + int(tok.get("expires_in", 28800)) * 1000
+                self._expires_at = now_ms + int(tok.get("expires_in", 36000)) * 1000
                 self._email = (tok.get("account") or {}).get("email_address") or self._email
                 self._persist()
                 return
@@ -527,7 +527,7 @@ class Auth:
                     raise RuntimeError(f"Missing access_token")
                 access = tok["access_token"]
                 new_refresh = tok.get("refresh_token", refresh_token)
-                new_expires = now_ms + int(tok.get("expires_in", 28800)) * 1000
+                new_expires = now_ms + int(tok.get("expires_in", 36000)) * 1000
 
                 # Save to cache
                 try:
@@ -642,6 +642,8 @@ def _anthropic_headers(extra_beta: list[str] | None = None, model_id: str = "unk
         # Anthropic BLOCKS "claude-cli/" on the token endpoint — must use "claude-code/"
         "user-agent": f"claude-code/{CLAUDE_CODE_VERSION} (external, cli)",
         "x-client-request-id": str(uuid.uuid4()),
+        # Stable per-process session ID (mirrors Claude Code)
+        "X-Claude-Code-Session-Id": _session_id,
         # Stainless headers (mirrors Claude Code SDK fingerprint)
         "x-stainless-arch": "arm64" if "aarch64" in os.uname().machine else os.uname().machine,
         "x-stainless-lang": "js",
@@ -651,6 +653,10 @@ def _anthropic_headers(extra_beta: list[str] | None = None, model_id: str = "unk
         "x-stainless-runtime": "node",
         "x-stainless-timeout": "600",
     }
+
+
+# Stable per-process session ID (matches Claude Code's X-Claude-Code-Session-Id)
+_session_id = str(uuid.uuid4())
 
 
 def _anthropic_request(method: str, path: str, *, model_id: str = "unknown", **kwargs: Any) -> requests.Response:
@@ -1471,6 +1477,16 @@ def _build_anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
         override = _get_model_override(model)
         if not (override and override.get("disable_thinking")):
             req["thinking"] = body["thinking"]
+        # Strip effort for models that don't support it (haiku)
+        if override and override.get("disable_effort"):
+            if "output_config" in req and isinstance(req["output_config"], dict):
+                req["output_config"].pop("effort", None)
+                if not req["output_config"]:
+                    del req["output_config"]
+            if "thinking" in req and isinstance(req["thinking"], dict):
+                req["thinking"].pop("effort", None)
+                if not req["thinking"]:
+                    del req["thinking"]
 
     # ── Fast mode (Opus 4.6 only) ─────────────────────────────
     # Adds speed=fast for ~2.5x output throughput.
