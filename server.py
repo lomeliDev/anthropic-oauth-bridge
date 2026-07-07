@@ -26,9 +26,11 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -60,6 +62,15 @@ ANTHROPIC_CLIENT_ID = os.environ.get(
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 OAUTH_TOKEN_URL = "https://claude.ai/v1/oauth/token"
+# Anthropic migrated to platform.claude.com; console.anthropic.com now 404s.
+OAUTH_TOKEN_URLS = [
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+]
+
+# Claude Code version for billing header (matches OpenCode plugin).
+CLAUDE_CODE_VERSION = os.environ.get("ANTHROPIC_CLI_VERSION", "2.1.112")
+CLAUDE_CODE_ENTRYPOINT = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
 
 FALLBACK_MODELS: list[dict[str, Any]] = [
     {"id": "claude-sonnet-4-5",       "object": "model", "owned_by": "anthropic", "created": 1735689600},
@@ -68,9 +79,40 @@ FALLBACK_MODELS: list[dict[str, Any]] = [
 ]
 
 # ============================================================
-# Auth — loads credentials from auth.json / credentials.json
+# Multi-account / credential pool support
 # ============================================================
+# accounts.json maps API keys to Anthropic OAuth accounts:
+# {
+#   "accounts": {
+#     "sk-xxx": {"label": "Account 1", "refresh_token": "...", "client_id": "..."}
+#   }
+# }
+BRIDGE_ACCOUNTS_FILE = Path(os.environ.get(
+    "BRIDGE_ACCOUNTS_FILE",
+    str(Path(__file__).resolve().parent / "accounts.json"),
+))
+BRIDGE_ADMIN_KEY = os.environ.get("BRIDGE_ADMIN_KEY", "")
+
+# Credential pool: per-account cached access tokens
+AUTH_CACHE_DIR = Path(os.environ.get(
+    "BRIDGE_AUTH_CACHE_DIR",
+    str(Path(__file__).resolve().parent / "auth_cache"),
+))
+
+# ============================================================
+# Auth — multi-account credential pool with race-safe refresh
+# ============================================================
+
 class Auth:
+    """Multi-account Anthropic OAuth credential manager.
+
+    Sources (in priority order, matching Hermes' resolve_anthropic_token):
+      1. auth.json (OpenCode-synced)
+      2. ~/.claude/.credentials.json (Claude Code native)
+      3. accounts.json (multi-account via admin API)
+      4. BRIDGE_REFRESH_TOKEN env var (single-account legacy)
+    """
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._access: str | None = None
@@ -78,6 +120,12 @@ class Auth:
         self._expires_at: int = 0
         self._email: str | None = None
         self._subscription: str | None = None
+        # Multi-account state
+        self._accounts: dict[str, dict[str, Any]] = {}  # api_key -> account dict
+        self._active_api_key: str = ""
+        self._account_lock = threading.Lock()
+
+    # ── Source loading ──────────────────────────────────────
 
     def _load(self) -> None:
         """Load access/refresh from the freshest available source."""
@@ -111,6 +159,44 @@ class Auth:
             except Exception as e:
                 print(f"[auth] warn reading credentials.json: {e}", file=sys.stderr)
 
+    # ── Race-safe re-read (Hermes pattern) ─────────────────
+
+    def _reread_credentials(self) -> dict[str, Any] | None:
+        """Re-read Claude Code credential files WITHOUT mutating state.
+
+        Used before refresh to detect if Claude Code already rotated the token.
+        Returns {accessToken, refreshToken, expiresAt} or None.
+        """
+        # Check auth.json first
+        if ANTHROPIC_AUTH_PATH.exists():
+            try:
+                data = json.loads(ANTHROPIC_AUTH_PATH.read_text())
+                entry = data.get("anthropic") or {}
+                if entry.get("access") and entry.get("expires", 0) > int(time.time() * 1000) + 30_000:
+                    return {
+                        "accessToken": entry["access"],
+                        "refreshToken": entry.get("refresh", ""),
+                        "expiresAt": int(entry["expires"]),
+                    }
+            except Exception:
+                pass
+        # Check credentials.json
+        if CLAUDE_CREDENTIALS_PATH.exists():
+            try:
+                data = json.loads(CLAUDE_CREDENTIALS_PATH.read_text())
+                oauth = data.get("claudeAiOauth") or {}
+                if oauth.get("accessToken") and oauth.get("expiresAt", 0) > int(time.time() * 1000) + 30_000:
+                    return {
+                        "accessToken": oauth["accessToken"],
+                        "refreshToken": oauth.get("refreshToken", ""),
+                        "expiresAt": int(oauth["expiresAt"]),
+                    }
+            except Exception:
+                pass
+        return None
+
+    # ── Persist ─────────────────────────────────────────────
+
     def _persist(self) -> None:
         """Write refreshed tokens back to both known locations."""
         if self._access and ANTHROPIC_AUTH_PATH.exists():
@@ -125,8 +211,19 @@ class Auth:
                 if self._refresh:
                     data["anthropic"]["refresh"] = self._refresh
                 data["anthropic"]["expires"] = self._expires_at
-                ANTHROPIC_AUTH_PATH.write_text(json.dumps(data, indent=2))
-                ANTHROPIC_AUTH_PATH.chmod(0o600)
+                tmp = ANTHROPIC_AUTH_PATH.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+                try:
+                    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, indent=2)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, ANTHROPIC_AUTH_PATH)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             except Exception as e:
                 print(f"[auth] warn persisting auth.json: {e}", file=sys.stderr)
 
@@ -139,34 +236,72 @@ class Auth:
                 if self._refresh:
                     oauth["refreshToken"] = self._refresh
                 oauth["expiresAt"] = self._expires_at
-                CLAUDE_CREDENTIALS_PATH.write_text(json.dumps(data, indent=2))
-                CLAUDE_CREDENTIALS_PATH.chmod(0o600)
+                tmp = CLAUDE_CREDENTIALS_PATH.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+                try:
+                    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, indent=2)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, CLAUDE_CREDENTIALS_PATH)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             except Exception as e:
                 print(f"[auth] warn persisting credentials.json: {e}", file=sys.stderr)
+
+    # ── Token refresh ───────────────────────────────────────
 
     def _refresh_token(self) -> None:
         if not self._refresh:
             raise RuntimeError("No refresh token available; run 'claude' and 'opencode auth login'")
 
-        r = requests.post(
-            OAUTH_TOKEN_URL,
-            data={
-                "client_id": ANTHROPIC_CLIENT_ID,
-                "refresh_token": self._refresh,
-                "grant_type": "refresh_token",
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        tok = r.json()
-        if "access_token" not in tok:
-            raise RuntimeError(f"Refresh response missing access_token: {tok}")
-        self._access = tok["access_token"]
-        # Anthropic rotates refresh tokens on every refresh.
-        self._refresh = tok.get("refresh_token") or self._refresh
-        self._expires_at = int(time.time() * 1000) + int(tok.get("expires_in", 28800)) * 1000
-        self._email = (tok.get("account") or {}).get("email_address") or self._email
-        self._persist()
+        now_ms = int(time.time() * 1000)
+
+        # Race-safe: re-read credentials first to avoid racing Claude Code
+        fresh = self._reread_credentials()
+        if fresh and fresh["accessToken"] != self._access and fresh["expiresAt"] > now_ms + 30_000:
+            print("[auth] adopted Claude Code's already-refreshed token", flush=True)
+            self._access = fresh["accessToken"]
+            self._refresh = fresh.get("refreshToken") or self._refresh
+            self._expires_at = fresh["expiresAt"]
+            self._persist()
+            return
+
+        refresh_token = (fresh or {}).get("refreshToken") or self._refresh
+        if not refresh_token:
+            raise RuntimeError("No refresh token available")
+
+        # Try multiple token endpoints (platform.claude.com first, then console.anthropic.com)
+        last_error = None
+        for endpoint in OAUTH_TOKEN_URLS:
+            try:
+                r = requests.post(
+                    endpoint,
+                    data={
+                        "client_id": ANTHROPIC_CLIENT_ID,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                tok = r.json()
+                if "access_token" not in tok:
+                    raise RuntimeError(f"Refresh response missing access_token: {tok}")
+                self._access = tok["access_token"]
+                # Anthropic rotates refresh tokens on every refresh.
+                self._refresh = tok.get("refresh_token") or self._refresh
+                self._expires_at = now_ms + int(tok.get("expires_in", 28800)) * 1000
+                self._email = (tok.get("account") or {}).get("email_address") or self._email
+                self._persist()
+                return
+            except Exception as e:
+                last_error = e
+                continue
+        raise RuntimeError(f"Token refresh failed at all endpoints: {last_error}")
 
     def get_token(self, allow_refresh: bool = True) -> str:
         with self._lock:
@@ -178,6 +313,162 @@ class Auth:
                 self._refresh_token()
                 return self._access
             raise RuntimeError("OAuth access token expired and refresh is disabled")
+
+    # ── Multi-account support ───────────────────────────────
+
+    def _load_accounts(self) -> None:
+        """Load multi-account config from accounts.json."""
+        if not BRIDGE_ACCOUNTS_FILE.exists():
+            return
+        try:
+            with self._account_lock:
+                data = json.loads(BRIDGE_ACCOUNTS_FILE.read_text())
+                self._accounts = data.get("accounts", {})
+        except Exception as e:
+            print(f"[auth] warn loading accounts.json: {e}", file=sys.stderr)
+
+    def _save_accounts(self) -> None:
+        """Persist accounts back to accounts.json."""
+        BRIDGE_ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BRIDGE_ACCOUNTS_FILE.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"accounts": self._accounts}, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, BRIDGE_ACCOUNTS_FILE)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def resolve_account_by_key(self, api_key: str) -> dict[str, Any] | None:
+        """Find account by API key. Returns account dict or None."""
+        self._load_accounts()
+        return self._accounts.get(api_key)
+
+    def get_token_for_account(self, api_key: str) -> str:
+        """Get a fresh access token for a specific multi-account entry."""
+        account = self.resolve_account_by_key(api_key)
+        if not account:
+            raise RuntimeError(f"Unknown API key: {api_key[:16]}...")
+
+        refresh_token = account.get("refresh_token", "")
+        if not refresh_token:
+            raise RuntimeError(f"No refresh token for account: {account.get('label', 'unknown')}")
+
+        # Check cached token
+        cache_file = AUTH_CACHE_DIR / f"{hashlib.sha256(api_key.encode()).hexdigest()[:16]}.json"
+        now_ms = int(time.time() * 1000)
+
+        AUTH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(AUTH_CACHE_DIR), 0o700)
+        except OSError:
+            pass
+
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text())
+                if cached.get("expires_at", 0) > now_ms + 30_000:
+                    return cached["access_token"]
+            except Exception:
+                pass
+
+        # Refresh
+        client_id = account.get("client_id", ANTHROPIC_CLIENT_ID)
+        last_error = None
+        for endpoint in OAUTH_TOKEN_URLS:
+            try:
+                r = requests.post(
+                    endpoint,
+                    data={
+                        "client_id": client_id,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                tok = r.json()
+                if "access_token" not in tok:
+                    raise RuntimeError(f"Missing access_token")
+                access = tok["access_token"]
+                new_refresh = tok.get("refresh_token", refresh_token)
+                new_expires = now_ms + int(tok.get("expires_in", 28800)) * 1000
+
+                # Save to cache
+                try:
+                    tmp_cache = cache_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+                    fd = os.open(str(tmp_cache), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump({
+                            "access_token": access,
+                            "refresh_token": new_refresh,
+                            "expires_at": new_expires,
+                        }, fh)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp_cache, cache_file)
+                finally:
+                    try:
+                        tmp_cache.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+                # Update accounts.json if refresh_token changed
+                if new_refresh != refresh_token:
+                    account["refresh_token"] = new_refresh
+                    self._save_accounts()
+
+                return access
+            except Exception as e:
+                last_error = e
+                continue
+        raise RuntimeError(f"Account token refresh failed: {last_error}")
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        """List all accounts (without secrets)."""
+        self._load_accounts()
+        result = []
+        for api_key, account in self._accounts.items():
+            result.append({
+                "api_key_prefix": api_key[:16] + "...",
+                "label": account.get("label", ""),
+                "email": account.get("email", ""),
+                "has_refresh_token": bool(account.get("refresh_token")),
+            })
+        return result
+
+    def add_account(self, api_key: str, label: str, refresh_token: str,
+                    client_id: str = "", email: str = "") -> dict[str, Any]:
+        """Add a new multi-account entry."""
+        self._load_accounts()
+        self._accounts[api_key] = {
+            "label": label,
+            "refresh_token": refresh_token,
+            "client_id": client_id or ANTHROPIC_CLIENT_ID,
+            "email": email,
+        }
+        self._save_accounts()
+        return {"ok": True, "api_key_prefix": api_key[:16] + "..."}
+
+    def remove_account(self, api_key: str) -> dict[str, Any]:
+        """Remove a multi-account entry."""
+        self._load_accounts()
+        if api_key in self._accounts:
+            del self._accounts[api_key]
+            self._save_accounts()
+            # Clear cache
+            cache_file = AUTH_CACHE_DIR / f"{hashlib.sha256(api_key.encode()).hexdigest()[:16]}.json"
+            try:
+                cache_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {"ok": True}
+        return {"ok": False, "error": "Account not found"}
 
     @property
     def email(self) -> str | None:
@@ -212,14 +503,15 @@ def _anthropic_headers(extra_beta: list[str] | None = None) -> dict[str, str]:
     ]
     if extra_beta:
         beta.extend(extra_beta)
+    token = _get_access_token_for_request()
     return {
-        "Authorization": f"Bearer {auth.get_token()}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": ",".join(beta),
         "anthropic-dangerous-direct-browser-access": "true",
         "x-app": "cli",
-        "user-agent": "claude-cli/2.1.112 (external, sdk-cli)",
+        "user-agent": f"claude-cli/{CLAUDE_CODE_VERSION} (external, sdk-cli)",
         "x-client-request-id": str(uuid.uuid4()),
     }
 
@@ -232,8 +524,9 @@ def _anthropic_request(method: str, path: str, **kwargs: Any) -> requests.Respon
         resp = requests.request(method, url, headers=headers, timeout=60, **kwargs)
         if resp.status_code == 401 and attempt == 1:
             try:
-                auth.get_token(allow_refresh=True)
-                headers["Authorization"] = f"Bearer {auth.get_token()}"
+                # Force-refresh via get_token — bypasses cache
+                fresh_token = auth.get_token(allow_refresh=True)
+                headers["Authorization"] = f"Bearer {fresh_token}"
                 continue
             except Exception:
                 break
@@ -281,6 +574,194 @@ def fetch_available_models() -> list[dict[str, Any]]:
 # ============================================================
 # OpenAI -> Anthropic conversion helpers
 # ============================================================
+
+# ── Claude Code request transforms ──────────────────────────
+# These mirrors the opencode-claude-auth plugin's transforms.js.
+# Without these, Anthropic's OAuth validation rejects requests
+# with 400 errors ("out of extra usage", "invalid tool name", etc.)
+
+SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+BILLING_SALT = "59cf53e54c78"
+TOOL_PREFIX = "mcp_"
+
+def _extract_first_user_message_text(messages: list[dict[str, Any]]) -> str:
+    """Extract text from the first user message's first text block."""
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return block.get("text", "")
+    return ""
+
+def _compute_cch(message_text: str) -> str:
+    """First 5 hex chars of SHA-256(messageText)."""
+    return hashlib.sha256(message_text.encode()).hexdigest()[:5]
+
+def _compute_version_suffix(message_text: str, version: str) -> str:
+    """3-char hash suffix for billing header."""
+    sampled = "".join(message_text[i] if i < len(message_text) else "0" for i in (4, 7, 20))
+    inp = f"{BILLING_SALT}{sampled}{version}"
+    return hashlib.sha256(inp.encode()).hexdigest()[:3]
+
+def _build_billing_header(messages: list[dict[str, Any]]) -> str:
+    """Build x-anthropic-billing-header string.
+
+    Format: cc_version=V.S; cc_entrypoint=E; cch=H;
+    """
+    text = _extract_first_user_message_text(messages)
+    suffix = _compute_version_suffix(text, CLAUDE_CODE_VERSION)
+    cch = _compute_cch(text)
+    return (
+        f"x-anthropic-billing-header: "
+        f"cc_version={CLAUDE_CODE_VERSION}.{suffix}; "
+        f"cc_entrypoint={CLAUDE_CODE_ENTRYPOINT}; "
+        f"cch={cch};"
+    )
+
+def _pascal_case_tool_name(name: str) -> str:
+    """Prefix tool name with mcp_ and uppercase first char.
+
+    Claude Code uses PascalCase after mcp_ (e.g. mcp_Bash, mcp_Read).
+    Lowercase names (mcp_bash) are flagged as non-Claude-Code clients
+    and rejected by Anthropic's OAuth validation.
+    """
+    return f"{TOOL_PREFIX}{name[0].upper()}{name[1:]}" if name else name
+
+def _unprefix_tool_name(name: str) -> str:
+    """Reverse pascal_case: mcp_Bash → bash."""
+    if name.startswith(TOOL_PREFIX) and len(name) > len(TOOL_PREFIX):
+        return name[len(TOOL_PREFIX)].lower() + name[len(TOOL_PREFIX)+1:]
+    return name
+
+def _repair_orphan_tool_pairs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove tool_use/tool_result blocks with missing counterparts."""
+    tool_use_ids: set[str] = set()
+    tool_result_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                tool_use_ids.add(block["id"])
+            if block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                tool_result_ids.add(block["tool_use_id"])
+
+    orphaned_uses = tool_use_ids - tool_result_ids
+    orphaned_results = tool_result_ids - tool_use_ids
+
+    if not orphaned_uses and not orphaned_results:
+        return messages
+
+    def _filter_block(block: dict[str, Any]) -> bool:
+        if block.get("type") == "tool_use" and block.get("id") in orphaned_uses:
+            return False
+        if block.get("type") == "tool_result" and block.get("tool_use_id") in orphaned_results:
+            return False
+        return True
+
+    result = []
+    for msg in messages:
+        if not isinstance(msg.get("content"), list):
+            result.append(msg)
+            continue
+        filtered = [b for b in msg["content"] if _filter_block(b)]
+        if filtered:
+            result.append({**msg, "content": filtered})
+    return result
+
+def _transform_anthropic_request(req: dict[str, Any]) -> dict[str, Any]:
+    """Apply Claude Code OAuth transforms to the Anthropic request body.
+
+    1. Billing header → system[0] (no cache_control)
+    2. System identity → must be a standalone system entry
+    3. Non-billing/identity system → moved to first user message
+    4. Tool names → PascalCase (mcp_Bash not mcp_bash)
+    5. Orphan tool repair → remove mismatched tool_use/tool_result
+    """
+    messages = req.get("messages", [])
+
+    # 1. Billing header
+    billing_header = _build_billing_header(messages)
+    system = req.get("system")
+    if not isinstance(system, list):
+        system = [{"type": "text", "text": system}] if isinstance(system, str) else []
+
+    # Remove any existing billing header entries
+    system = [
+        e for e in system
+        if not (isinstance(e, dict) and e.get("type") == "text"
+                and isinstance(e.get("text"), str)
+                and e["text"].startswith("x-anthropic-billing-header"))
+    ]
+
+    # 2. Split system identity from other system content
+    BILLING_PREFIX = "x-anthropic-billing-header"
+    kept_system: list[dict[str, Any]] = []
+    moved_texts: list[str] = []
+
+    for entry in system:
+        txt = entry.get("text", "") if isinstance(entry, dict) else str(entry)
+        if isinstance(entry, dict):
+            if txt.startswith(BILLING_PREFIX) or txt.startswith(SYSTEM_IDENTITY):
+                kept_system.append(entry)
+            elif txt.strip():
+                moved_texts.append(txt)
+        elif isinstance(entry, str) and entry.strip():
+            if entry.startswith(BILLING_PREFIX) or entry.startswith(SYSTEM_IDENTITY):
+                kept_system.append({"type": "text", "text": entry})
+            else:
+                moved_texts.append(entry)
+
+    # Insert billing header as system[0]
+    kept_system.insert(0, {"type": "text", "text": billing_header})
+
+    # 3. Relocate non-identity system content to first user message
+    if moved_texts:
+        first_user = next((m for m in messages if m.get("role") == "user"), None)
+        if first_user:
+            prefix = "\n\n".join(moved_texts)
+            content = first_user.get("content", "")
+            if isinstance(content, str):
+                first_user["content"] = f"{prefix}\n\n{content}"
+            elif isinstance(content, list):
+                content.insert(0, {"type": "text", "text": prefix})
+
+    req["system"] = kept_system
+
+    # 4. Tool PascalCase
+    if isinstance(req.get("tools"), list):
+        for tool in req["tools"]:
+            if isinstance(tool, dict) and tool.get("name"):
+                tool["name"] = _pascal_case_tool_name(tool["name"])
+
+    # Also transform tool names in conversation history
+    for msg in messages:
+        if not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                block["name"] = _pascal_case_tool_name(block["name"])
+
+    # 5. Orphan tool repair
+    req["messages"] = _repair_orphan_tool_pairs(messages)
+
+    return req
+
+def _strip_tool_prefix_from_response(text: str) -> str:
+    """Reverse tool name prefixing in response text."""
+    import re as _re
+    return _re.sub(
+        r'"name"\s*:\s*"mcp_([^"]+)"',
+        lambda m: f'"name": "{_unprefix_tool_name("mcp_" + m.group(1))}"',
+        text,
+    )
+
+
 def _download_image(url: str, timeout: int = 20) -> tuple[str, str]:
     """Return (mime_type, base64_data) for an image given by URL or data URI."""
     if url.startswith("data:"):
@@ -796,6 +1277,9 @@ def _build_anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
     if "thinking" in body and isinstance(body["thinking"], dict):
         req["thinking"] = body["thinking"]
 
+    # Apply Claude Code OAuth transforms for billing/system identity/tool naming
+    req = _transform_anthropic_request(req)
+
     return req
 
 
@@ -816,11 +1300,12 @@ def _anthropic_content_to_openai_message(content: list[dict[str, Any]]) -> tuple
             thinking = (thinking or "") + block.get("thinking", "")
         elif btype == "tool_use":
             inp = block.get("input", {})
+            raw_name = block.get("name", "")
             tool_calls.append({
                 "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
                 "type": "function",
                 "function": {
-                    "name": block.get("name", ""),
+                    "name": _unprefix_tool_name(raw_name),
                     "arguments": json.dumps(inp) if isinstance(inp, dict) else str(inp),
                 },
             })
@@ -841,16 +1326,54 @@ def _anthropic_usage_to_openai(usage: dict[str, Any]) -> dict[str, int]:
 
 
 # ============================================================
-# API key authentication
+# API key authentication (multi-account aware)
 # ============================================================
 def _check_api_key() -> tuple[dict[str, Any], int] | None:
-    if not BRIDGE_API_KEY:
+    """Validate client API key against BRIDGE_API_KEY or accounts.json.
+
+    Returns None if auth passes, or (error_dict, status_code) if not.
+    When multi-account is enabled (accounts.json has entries), any valid
+    account API key is accepted. Otherwise, falls back to BRIDGE_API_KEY.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        # No auth header — allow if bridge has no auth configured
+        if not BRIDGE_API_KEY and not auth._accounts:
+            return None
+        return {"error": {"message": "Missing Authorization header", "type": "authentication_error"}}, 401
+
+    api_key = auth_header[7:]
+
+    # Multi-account: check accounts.json
+    if api_key in auth._accounts:
         return None
+
+    # Single-account: check BRIDGE_API_KEY
+    if BRIDGE_API_KEY and api_key == BRIDGE_API_KEY:
+        return None
+
+    return {"error": {"message": "Invalid API key", "type": "authentication_error"}}, 401
+
+
+def _get_access_token_for_request() -> str:
+    """Resolve access token: multi-account API key → account token, else default."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        api_key = auth_header[7:]
+        if api_key in auth._accounts:
+            return auth.get_token_for_account(api_key)
+    return auth.get_token()
+
+
+def _admin_auth() -> tuple[dict[str, Any], int] | None:
+    """Authenticate admin API requests."""
+    if not BRIDGE_ADMIN_KEY:
+        return None  # Admin API open (dev mode)
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return {"error": {"message": "Missing Authorization header", "type": "authentication_error"}}, 401
-    if auth_header[7:] != BRIDGE_API_KEY:
-        return {"error": {"message": "Invalid API key", "type": "authentication_error"}}, 401
+    if auth_header[7:] != BRIDGE_ADMIN_KEY:
+        return {"error": {"message": "Invalid admin key", "type": "authentication_error"}}, 401
     return None
 
 
@@ -861,11 +1384,12 @@ def _check_api_key() -> tuple[dict[str, Any], int] | None:
 def index():
     return jsonify({
         "name": "anthropic-oauth-bridge",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "openai_compatible": True,
         "email": auth.email,
         "upstream": ANTHROPIC_BASE_URL,
-        "endpoints": ["/health", "/v1/models", "/v1/chat/completions"],
+        "endpoints": ["/health", "/v1/models", "/v1/chat/completions", "/v1/usage"],
+        "admin_endpoints": ["/admin/accounts", "/admin/health"],
     })
 
 
@@ -877,7 +1401,72 @@ def health():
         "subscription": auth.subscription,
         "token_expires_at": auth._expires_at,
         "now_ms": int(time.time() * 1000),
+        "multi_account_enabled": bool(auth._accounts),
+        "account_count": len(auth._accounts),
     })
+
+
+# ── Admin endpoints ─────────────────────────────────────────
+
+@app.route("/admin/health")
+def admin_health():
+    """Full health check including credential status."""
+    if err := _admin_auth():
+        return jsonify(err[0]), err[1]
+    return jsonify({
+        "status": "ok",
+        "email": auth.email,
+        "subscription": auth.subscription,
+        "token_expires_at": auth._expires_at,
+        "now_ms": int(time.time() * 1000),
+        "accounts": auth.list_accounts(),
+        "token_endpoints": OAUTH_TOKEN_URLS,
+    })
+
+
+@app.route("/admin/accounts", methods=["GET"])
+def admin_list_accounts():
+    """List all multi-account entries (without secrets)."""
+    if err := _admin_auth():
+        return jsonify(err[0]), err[1]
+    return jsonify({"accounts": auth.list_accounts()})
+
+
+@app.route("/admin/accounts", methods=["POST"])
+def admin_add_account():
+    """Add a new multi-account entry.
+
+    Body: {"api_key": "sk-...", "label": "My Account",
+           "refresh_token": "1//...", "client_id": "...", "email": "..."}
+    """
+    if err := _admin_auth():
+        return jsonify(err[0]), err[1]
+    body = request.get_json(force=True, silent=True) or {}
+    api_key = body.get("api_key", "").strip()
+    if not api_key:
+        return jsonify({"error": "api_key is required"}), 400
+    label = body.get("label", "").strip() or f"Account {len(auth._accounts) + 1}"
+    refresh_token = body.get("refresh_token", "").strip()
+    if not refresh_token:
+        return jsonify({"error": "refresh_token is required"}), 400
+    client_id = body.get("client_id", "").strip()
+    email = body.get("email", "").strip()
+    result = auth.add_account(api_key, label, refresh_token, client_id, email)
+    return jsonify(result)
+
+
+@app.route("/admin/accounts/<path:api_key>", methods=["DELETE"])
+def admin_remove_account(api_key: str):
+    """Remove a multi-account entry by API key."""
+    if err := _admin_auth():
+        return jsonify(err[0]), err[1]
+    result = auth.remove_account(api_key)
+    if result.get("ok"):
+        return jsonify(result)
+    return jsonify(result), 404
+
+
+# ── User endpoints ──────────────────────────────────────────
 
 
 @app.route("/v1/models")
@@ -895,6 +1484,23 @@ def get_model(model_id: str):
         if m["id"] == model_id:
             return jsonify(m)
     return jsonify({"error": {"message": "model not found", "type": "invalid_request_error"}}), 404
+
+
+@app.route("/v1/usage")
+def usage():
+    """Return current credential status and account info."""
+    if err := _check_api_key():
+        return jsonify(err[0]), err[1]
+    now_ms = int(time.time() * 1000)
+    return jsonify({
+        "email": auth.email,
+        "subscription": auth.subscription,
+        "token_expires_at": auth._expires_at,
+        "token_remaining_ms": max(0, auth._expires_at - now_ms),
+        "now_ms": now_ms,
+        "accounts": len(auth._accounts),
+        "token_endpoints": OAUTH_TOKEN_URLS,
+    })
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
@@ -968,7 +1574,7 @@ def chat_completions():
                                 "index": tool_index,
                                 "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
                                 "type": "function",
-                                "function": {"name": block.get("name", ""), "arguments": ""},
+                                "function": {"name": _unprefix_tool_name(block.get("name", "")), "arguments": ""},
                             }
                     elif etype == "content_block_delta":
                         delta = ev.get("delta") or {}
@@ -1105,6 +1711,13 @@ def main() -> None:
         print(f"[bridge] token exp  : {auth._expires_at}", flush=True)
     except Exception as e:
         print(f"[bridge] WARN init: {e}", flush=True)
+
+    # Load multi-account config
+    auth._load_accounts()
+    if auth._accounts:
+        print(f"[bridge] accounts   : {len(auth._accounts)} multi-account entries", flush=True)
+        for api_key, acc in auth._accounts.items():
+            print(f"  - {acc.get('label', '?'):20s} key={api_key[:16]}...", flush=True)
 
     print(f"[bridge] listening  : http://{args.host}:{args.port}", flush=True)
     try:
