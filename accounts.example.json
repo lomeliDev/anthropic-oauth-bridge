@@ -1,0 +1,13 @@
+{
+  "_comment": "Multi-account configuration for Anthropic OAuth Bridge.",
+  "_docs": "Add accounts via the admin API: POST /admin/accounts",
+  "_docs_curl": "curl -s -X POST http://127.0.0.1:64173/admin/accounts -H 'Content-Type: application/json' -H 'Authorization: Bearer <BRIDGE_ADMIN_KEY>' -d '{\"api_key\":\"sk-example123\",\"label\":\"Personal\",\"refresh_token\":\"1//abc...\",\"email\":\"you@gmail.com\"}'",
+  "accounts": {
+    "sk-example-account-1": {
+      "label": "Personal Account",
+      "refresh_token": "1//your-google-oauth-refresh-token-here",
+      "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+      "email": "you@gmail.com"
+    }
+  }
+}

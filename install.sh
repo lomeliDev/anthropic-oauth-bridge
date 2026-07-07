@@ -446,7 +446,7 @@ echo "────────────────────────�
 echo "  1. Install OpenCode and the Claude Code CLI if they are missing."
 echo "  2. Run the OAuth logins for you (browser tabs will open)."
 echo "  3. Install the bridge and its Python dependencies."
-echo "  4. Ask for a port and an optional API key."
+echo "  4. Ask for a port, an optional API key, and an admin key for multi-account."
 echo "  5. Install and start a system service (systemd / launchd)."
 echo ""
 echo -e "${YELLOW}This is an unofficial tool. Use it at your own risk.${RESET}"
@@ -538,6 +538,19 @@ EOF
 
 if [[ -n "$API_KEY" ]]; then
     echo "BRIDGE_API_KEY=${API_KEY}" >> .env
+fi
+
+# Optional admin key
+echo ""
+echo "The bridge supports MULTI-ACCOUNT (multiple Anthropic accounts behind one bridge)."
+echo "You manage accounts via the admin API, protected by BRIDGE_ADMIN_KEY."
+read -rp "Set an admin API key? [random]: " ADMIN_KEY
+ADMIN_KEY="${ADMIN_KEY:-$RANDOM_KEY}"
+if [[ -n "$ADMIN_KEY" ]]; then
+    echo "BRIDGE_ADMIN_KEY=${ADMIN_KEY}" >> .env
+    success "Admin API key set. Use it to call POST /admin/accounts."
+else
+    info "Admin API left open (no key). Set BRIDGE_ADMIN_KEY later to protect it."
 fi
 chmod 600 .env
 success "Wrote configuration to .env"
@@ -757,6 +770,14 @@ if [[ -n "$API_KEY" ]]; then
     info "API key:           ${API_KEY}"
 else
     info "API key:           (none / no client auth)"
+fi
+if [[ -n "${ADMIN_KEY:-}" ]]; then
+    info "Admin key:         ${ADMIN_KEY}"
+    info "Add accounts:"
+    echo "     curl -s -X POST http://127.0.0.1:${PORT}/admin/accounts \\"
+    echo "       -H 'Authorization: Bearer ${ADMIN_KEY}' \\"
+    echo "       -H 'Content-Type: application/json' \\"
+    echo "       -d '{\"api_key\":\"sk-...\",\"label\":\"Account\",\"refresh_token\":\"1//...\"}'"
 fi
 
 info "Check the logs:"

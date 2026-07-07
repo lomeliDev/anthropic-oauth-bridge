@@ -47,6 +47,15 @@ nohup.out
 *.env
 secrets/
 
+# Multi-account
+accounts.json
+auth_cache/
+.active_account
+
+# Account exports / backups
+*.accounts.json
+/account-exports/
+
 # Systemd runtime
 anthropic-oauth-bridge.service.rendered
 
