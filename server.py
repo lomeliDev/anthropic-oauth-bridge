@@ -72,42 +72,58 @@ OAUTH_TOKEN_URLS = [
 CLAUDE_CODE_VERSION = os.environ.get("ANTHROPIC_CLI_VERSION", "2.1.112")
 CLAUDE_CODE_ENTRYPOINT = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
 
-# ── Claude model config (mirrors opencode-claude-auth model-config.js) ──
+# ── Claude model config (mirrors Hermes anthropic_adapter + OpenCode) ──
 
-CLAUDE_BASE_BETAS = [
+# Common betas for ALL Anthropic requests (matches Hermes _COMMON_BETAS)
+CLAUDE_COMMON_BETAS = [
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+]
+
+# OAuth-only betas (matches Hermes _OAUTH_ONLY_BETAS)
+CLAUDE_OAUTH_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-    "prompt-caching-scope-2026-01-05",
-    "context-management-2025-06-27",
-    "advisor-tool-2026-03-01",
 ]
 
+# Full OAuth beta set = common + OAuth-only
+CLAUDE_OAUTH_ALL_BETAS = CLAUDE_COMMON_BETAS + CLAUDE_OAUTH_BETAS
+
+# Additional betas for specific features
+CLAUDE_LONG_CONTEXT_BETA = "context-1m-2025-08-07"
+CLAUDE_FAST_MODE_BETA = "fast-mode-2026-02-01"
+CLAUDE_EFFORT_BETA = "effort-2025-11-24"
+
+# Long context betas (for auto-exclusion recovery)
 CLAUDE_LONG_CONTEXT_BETAS = [
-    "context-1m-2025-08-07",
+    CLAUDE_LONG_CONTEXT_BETA,
     "interleaved-thinking-2025-05-14",
 ]
 
-# Model-specific overrides (exclude betas or add extra betas)
+# Model-specific overrides
 CLAUDE_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
     "haiku": {
         "exclude": ["interleaved-thinking-2025-05-14"],
         "disable_effort": True,
+        "disable_thinking": True,
     },
     "4-6": {
-        "add": ["effort-2025-11-24"],
+        "add": [CLAUDE_EFFORT_BETA],
+        "supports_fast_mode": True,
     },
     "4-7": {
-        "add": ["effort-2025-11-24"],
+        "add": [CLAUDE_EFFORT_BETA],
+        "forbids_sampling_params": True,
     },
 }
 
 # Runtime beta exclusion tracking (auto-recovery from errors)
 _excluded_betas: dict[str, set[str]] = {}
 
-def _get_model_betas(model_id: str, excluded: set[str] | None = None) -> list[str]:
+def _get_model_betas(model_id: str, excluded: set[str] | None = None, is_oauth: bool = True) -> list[str]:
     """Get beta headers for a model, applying overrides and exclusions."""
-    betas = list(CLAUDE_BASE_BETAS)
+    # Start with OAuth betas or common-only depending on auth mode
+    betas = list(CLAUDE_OAUTH_ALL_BETAS if is_oauth else CLAUDE_COMMON_BETAS)
 
     # Apply model overrides
     lower = model_id.lower()
@@ -121,6 +137,11 @@ def _get_model_betas(model_id: str, excluded: set[str] | None = None) -> list[st
                 for add_beta in override["add"]:
                     if add_beta not in betas:
                         betas.append(add_beta)
+            if override.get("supports_fast_mode") and is_oauth:
+                if CLAUDE_FAST_MODE_BETA not in betas:
+                    betas.append(CLAUDE_FAST_MODE_BETA)
+            if override.get("forbids_sampling_params"):
+                _current_model_forbids_sampling = True
             break  # First match wins
 
     # Filter excluded betas
@@ -137,6 +158,18 @@ def _get_model_override(model_id: str) -> dict[str, Any] | None:
         if pattern in lower:
             return override
     return None
+
+
+def _supports_fast_mode(model_id: str) -> bool:
+    """Check if model supports fast mode (Opus 4.6 only)."""
+    override = _get_model_override(model_id)
+    return bool(override and override.get("supports_fast_mode"))
+
+
+def _forbids_sampling_params(model_id: str) -> bool:
+    """Check if model rejects temperature/top_p/top_k (Opus 4.7+)."""
+    override = _get_model_override(model_id)
+    return bool(override and override.get("forbids_sampling_params"))
 
 
 def _is_long_context_error(response_body: str) -> bool:
@@ -765,21 +798,21 @@ def _build_billing_header(messages: list[dict[str, Any]]) -> str:
     )
 
 def _pascal_case_tool_name(name: str) -> str:
-    """Prefix tool name with mcp__ and uppercase first char.
+    """ALL tools get mcp__ prefix for OAuth (Hermes pattern).
 
-    Claude Code uses PascalCase after mcp__ (e.g. mcp__Bash, mcp__Read).
-    Hermes discovered Anthropic rejects single-underscore mcp_ as
-    'third-party app fingerprint'. Double-underscore mcp__ passes.
-    Non-MCP tools get PascalCase without prefix.
+    Hermes discovered that on OAuth, ALL tool names must use mcp__ prefix.
+    Bare tools (read_file) → mcp__Read_file
+    Single-underscore MCP tools (mcp_server_tool) → mcp__Server_tool
+    Already double-underscore → keep as-is
+    Non-OAuth mode (api_key) → keep original name
     """
     if not name:
         return name
-    # MCP tools: mcp__Bash (double underscore)
-    if name.startswith("mcp_") and not name.startswith("mcp__"):
-        return f"mcp__{name[4].upper()}{name[5:]}" if len(name) > 4 else name
     if name.startswith("mcp__"):
-        return f"mcp__{name[5].upper()}{name[6:]}" if len(name) > 5 else name
-    return name
+        return name  # already correct
+    if name.startswith("mcp_"):
+        return "mcp__" + name[4:]  # single → double underscore
+    return "mcp__" + name  # bare → mcp__ prefix + keep original case
 
 
 def _unprefix_tool_name(name: str) -> str:
@@ -1435,7 +1468,20 @@ def _build_anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
             req["tool_choice"] = {"type": "tool", "name": "json_schema_response"}
 
     if "thinking" in body and isinstance(body["thinking"], dict):
-        req["thinking"] = body["thinking"]
+        override = _get_model_override(model)
+        if not (override and override.get("disable_thinking")):
+            req["thinking"] = body["thinking"]
+
+    # ── Fast mode (Opus 4.6 only) ─────────────────────────────
+    # Adds speed=fast for ~2.5x output throughput.
+    if body.get("fast_mode") and _supports_fast_mode(model):
+        req.setdefault("extra_body", {})["speed"] = "fast"
+
+    # ── Strip sampling params on 4.7+ ─────────────────────────
+    # Opus 4.7+ rejects non-default temperature/top_p/top_k
+    if _forbids_sampling_params(model):
+        for key in ("temperature", "top_p", "top_k"):
+            req.pop(key, None)
 
     # Apply Claude Code OAuth transforms for billing/system identity/tool naming
     req = _transform_anthropic_request(req)
@@ -1478,11 +1524,17 @@ def _anthropic_content_to_openai_message(content: list[dict[str, Any]]) -> tuple
 
 
 def _anthropic_usage_to_openai(usage: dict[str, Any]) -> dict[str, int]:
-    return {
+    result = {
         "prompt_tokens": usage.get("input_tokens", 0),
         "completion_tokens": usage.get("output_tokens", 0),
         "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
     }
+    # Include cache tokens if present (Anthropic prompt caching)
+    if "cache_creation_input_tokens" in usage:
+        result["cache_creation_tokens"] = usage["cache_creation_input_tokens"]
+    if "cache_read_input_tokens" in usage:
+        result["cache_read_tokens"] = usage["cache_read_input_tokens"]
+    return result
 
 
 # ============================================================
