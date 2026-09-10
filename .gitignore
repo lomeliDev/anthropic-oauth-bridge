@@ -62,3 +62,5 @@ anthropic-oauth-bridge.service.rendered
 # Private documentation source
 info.md
 *.md.backup
+daemon/
+bridge.log
