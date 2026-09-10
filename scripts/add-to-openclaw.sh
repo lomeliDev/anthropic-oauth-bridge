@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Add the local Anthropic OAuth Bridge as a custom OpenAI-compatible provider in OpenClaw.
+# Add the local Anthropic Bridge as a custom OpenAI-compatible provider in OpenClaw.
 #
 set -euo pipefail
 
@@ -56,10 +56,10 @@ if [[ -z "${BRIDGE_API_KEY:-}" ]]; then
     success "API key saved to .env."
 
     info "Restarting bridge service to pick up the new API key ..."
-    if systemctl restart anthropic-oauth-bridge 2>/dev/null; then
+    if systemctl restart anthropic-bridge 2>/dev/null; then
         success "Bridge service restarted."
     else
-        warn "Could not restart anthropic-oauth-bridge via systemctl."
+        warn "Could not restart anthropic-bridge via systemctl."
         warn "If the bridge is already running, you may need to restart it manually."
     fi
     sleep 2
@@ -85,7 +85,7 @@ fi
 if [[ $# -ge 2 ]]; then
     PROVIDER_NAME="$2"
 else
-    PROVIDER_NAME=$(ask_with_default "Provider name" "anthropic-oauth-bridge")
+    PROVIDER_NAME=$(ask_with_default "Provider name" "anthropic-bridge")
 fi
 
 CONFIG_DIR="${HOME}/.openclaw"

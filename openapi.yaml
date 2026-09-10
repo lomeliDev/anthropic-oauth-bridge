@@ -1,0 +1,234 @@
+openapi: 3.1.0
+info:
+  title: Anthropic Bridge
+  version: 1.0.0-dev
+  description: |
+    OpenAI-compatible proxy over the **Anthropic Messages API**, authenticated with Anthropic Console **API keys**
+    or **AWS Bedrock** credentials (multi-account). Also exposes a native `/v1/messages` passthrough.
+
+    Subscription OAuth (Claude Pro/Max) is intentionally not supported (prohibited by Anthropic's terms, Feb 2026).
+
+    Extensions: `reasoning_effort` → extended thinking + `output_config.effort`, `reasoning_content` in responses,
+    `web_search` / `code_execution` native tools with `citations`, PDF/text documents, prompt caching, `user` → `metadata.user_id`,
+    real quota from `anthropic-ratelimit-*` headers.
+servers:
+  - url: http://127.0.0.1:64173
+tags:
+  - { name: openai, description: OpenAI-compatible endpoints }
+  - { name: anthropic, description: Native Anthropic passthrough }
+  - { name: quota }
+  - { name: admin, description: Protected by BRIDGE_ADMIN_KEY }
+  - { name: system }
+components:
+  securitySchemes:
+    apiKey: { type: http, scheme: bearer, description: "Client key (BRIDGE_API_KEY or an accounts.json key). Optional in single-account mode without BRIDGE_API_KEY." }
+    adminKey: { type: http, scheme: bearer, description: BRIDGE_ADMIN_KEY }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: object, properties: { message: { type: string }, type: { type: string }, code: { type: integer } } }
+    ContentPart:
+      oneOf:
+        - { type: object, properties: { type: { const: text }, text: { type: string } } }
+        - { type: object, properties: { type: { const: image_url }, image_url: { type: object, properties: { url: { type: string, description: "https://... or data:image/...;base64,..." } } } } }
+        - { type: object, properties: { type: { const: file }, file: { type: object, description: "PDF or text -> Anthropic document block; images -> image block. file_data (data URI) or file_url. Max 32 MB.", properties: { file_data: { type: string }, file_url: { type: string }, filename: { type: string } } } } }
+    ToolCall:
+      type: object
+      properties:
+        id: { type: string, example: toolu_01ABC }
+        type: { const: function }
+        function: { type: object, properties: { name: { type: string }, arguments: { type: string, description: JSON string } } }
+    Message:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [system, developer, user, assistant, tool] }
+        content: { oneOf: [ { type: string }, { type: "null" }, { type: array, items: { $ref: "#/components/schemas/ContentPart" } } ] }
+        tool_calls: { type: array, items: { $ref: "#/components/schemas/ToolCall" } }
+        tool_call_id: { type: string }
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string, example: claude-sonnet-4-6, description: "Anthropic model id (GET /v1/models). `models/` prefix tolerated." }
+        messages: { type: array, items: { $ref: "#/components/schemas/Message" } }
+        stream: { type: boolean, default: false }
+        stream_options: { type: object, properties: { include_usage: { type: boolean } } }
+        max_tokens: { type: integer, default: 8192, description: "capped to the model's max_output_tokens; raised automatically when thinking budget requires it" }
+        max_completion_tokens: { type: integer }
+        temperature: { type: number }
+        top_p: { type: number }
+        top_k: { type: integer }
+        stop: { oneOf: [ { type: string }, { type: array, items: { type: string } } ] }
+        tools:
+          type: array
+          items:
+            oneOf:
+              - { type: object, description: function tool, properties: { type: { const: function }, function: { type: object, properties: { name: { type: string }, description: { type: string }, parameters: { type: object } } } } }
+              - { type: object, description: "native tool", properties: { type: { type: string, enum: [web_search, web_search_preview, code_execution, code_interpreter] }, max_uses: { type: integer }, user_location: { type: object } } }
+        tool_choice: { oneOf: [ { type: string, enum: [auto, none, required] }, { type: object } ] }
+        response_format: { type: object, properties: { type: { type: string, enum: [text, json_object, json_schema] }, json_schema: { type: object } }, description: "json_object/json_schema -> forced JSON tool; the JSON is returned as content" }
+        reasoning_effort: { type: string, enum: [low, medium, high], description: "Enables extended thinking with budget 2048/8192/32768 and sets output_config.effort on Opus/Sonnet. Thinking text comes back as reasoning_content." }
+        thinking_budget: { type: integer, description: Extension. Exact thinking budget_tokens (min 1024). }
+        thinking: { type: object, description: "Native Anthropic thinking object, passed through as-is" }
+        web_search: { type: boolean, description: "Extension. Adds the web_search_20250305 server tool. Response carries citations[]." }
+        web_search_options: { type: object, description: "OpenAI compat: {max_uses, user_location:{approximate:{city,region,country,timezone}}}" }
+        code_execution: { type: boolean, description: "Extension. Adds the code_execution_20250522 server tool; code and output are rendered as markdown in content." }
+        prompt_caching: { type: boolean, default: true, description: "cache_control on the system prompt" }
+        user: { type: string, description: "End-user id -> metadata.user_id (sha256 of api_key:user). Same as X-Session-Id header. No server-side memory." }
+        logprobs: { description: ignored }
+        frequency_penalty: { description: ignored }
+        presence_penalty: { description: ignored }
+        n: { description: ignored }
+    ChatMessageOut:
+      type: object
+      properties:
+        role: { const: assistant }
+        content: { type: [string, "null"] }
+        tool_calls: { type: array, items: { $ref: "#/components/schemas/ToolCall" } }
+        reasoning_content: { type: string, description: "Extended thinking text (when reasoning_effort/thinking was requested)" }
+        citations: { type: array, items: { type: object, properties: { url: { type: string }, title: { type: string }, cited_text: { type: string } } } }
+        code_execution_results: { type: array, items: { type: object } }
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+        cache_read_tokens: { type: integer }
+        cache_creation_tokens: { type: integer }
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { const: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        choices: { type: array, items: { type: object, properties: { index: { type: integer }, message: { $ref: "#/components/schemas/ChatMessageOut" }, finish_reason: { type: string, enum: [stop, tool_calls, length] } } } }
+        usage: { $ref: "#/components/schemas/Usage" }
+    Model:
+      type: object
+      properties:
+        id: { type: string, example: claude-sonnet-4-6 }
+        object: { const: model }
+        owned_by: { const: anthropic }
+        created: { type: integer }
+        display_name: { type: string }
+        context_window: { type: integer, example: 200000 }
+        max_output_tokens: { type: integer, example: 64000 }
+        supports_thinking: { type: boolean }
+        supports_images: { type: boolean }
+        supports_pdf: { type: boolean }
+        supports_web_search: { type: boolean }
+        supports_code_execution: { type: boolean }
+        supports_1m_context: { type: boolean }
+        tier: { type: string, enum: [opus, sonnet, haiku, legacy, unknown] }
+    Quota:
+      type: object
+      description: "From anthropic-ratelimit-* response headers (per API key / organization). Bedrock accounts return a note."
+      properties:
+        label: { type: string }
+        backend: { type: string }
+        requests: { type: object, properties: { limit: { type: integer }, remaining: { type: integer }, reset: { type: string, format: date-time } } }
+        input_tokens: { type: object }
+        output_tokens: { type: object }
+        tokens: { type: object }
+        captured_at: { type: integer }
+        stats: { type: object }
+    Account:
+      type: object
+      properties:
+        api_key: { type: string }
+        label: { type: string }
+        backend: { type: string, enum: [anthropic, bedrock] }
+        configured: { type: boolean }
+        region: { type: [string, "null"] }
+        stats: { type: object }
+        quota: { $ref: "#/components/schemas/Quota" }
+paths:
+  /: { get: { tags: [system], summary: Bridge info, responses: { "200": { description: ok } } } }
+  /health: { get: { tags: [system], summary: "Status (ok / no_account); never 500", responses: { "200": { description: ok } } } }
+  /docs: { get: { tags: [system], summary: Swagger UI, responses: { "200": { description: html } } } }
+  /api/spec.yml: { get: { tags: [system], summary: This document, responses: { "200": { description: yaml } } } }
+  /v1/models:
+    get:
+      tags: [openai]
+      summary: "Model catalog (Anthropic GET /v1/models + per-family metadata; 1h cache)"
+      security: [ { apiKey: [] }, {} ]
+      responses: { "200": { description: ok, content: { application/json: { schema: { type: object, properties: { object: { const: list }, data: { type: array, items: { $ref: "#/components/schemas/Model" } } } } } } } }
+  /v1/models/{model_id}:
+    get:
+      tags: [openai]
+      parameters: [ { in: path, name: model_id, required: true, schema: { type: string } } ]
+      responses: { "200": { description: ok, content: { application/json: { schema: { $ref: "#/components/schemas/Model" } } } }, "404": { description: not found } }
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: "Chat (normal or streaming), tools, vision, PDF, thinking, web_search, code_execution"
+      security: [ { apiKey: [] }, {} ]
+      parameters: [ { in: header, name: X-Session-Id, schema: { type: string }, description: Same as body.user } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatCompletionRequest" }
+            examples:
+              simple: { value: { model: claude-haiku-4-5, messages: [ { role: user, content: "reply with exactly: OK" } ] } }
+              thinking: { value: { model: claude-sonnet-4-6, reasoning_effort: medium, messages: [ { role: user, content: "why is the sky blue?" } ] } }
+              web_search: { value: { model: claude-sonnet-4-6, web_search: true, messages: [ { role: user, content: "latest opencode release?" } ] } }
+              tools: { value: { model: claude-sonnet-4-6, messages: [ { role: user, content: "weather in Cuernavaca?" } ], tools: [ { type: function, function: { name: get_weather, parameters: { type: object, properties: { city: { type: string } } } } } ] } }
+              pdf: { value: { model: claude-sonnet-4-6, messages: [ { role: user, content: [ { type: text, text: "summarize" }, { type: file, file: { file_url: "https://example.com/doc.pdf" } } ] } ] } }
+      responses:
+        "200": { description: ok, content: { application/json: { schema: { $ref: "#/components/schemas/ChatCompletionResponse" } }, text/event-stream: { schema: { type: string, description: "OpenAI chunks; delta may carry content, reasoning_content or tool_calls; ends with data: [DONE]" } } } }
+        "400": { description: invalid request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { description: invalid key / no account }
+        "429": { description: rate limited upstream }
+        "502": { description: upstream error }
+  /v1/messages:
+    post:
+      tags: [anthropic]
+      summary: "Native Anthropic Messages API passthrough (same body/response; multi-account; anthropic-beta header forwarded)"
+      security: [ { apiKey: [] }, {} ]
+      responses: { "200": { description: Anthropic response }, "4XX": { description: Anthropic error } }
+  /v1/usage: { get: { tags: [openai], summary: Local per-model counters since startup (incl. cache tokens), responses: { "200": { description: ok } } } }
+  /v1/quota:
+    get:
+      tags: [quota]
+      summary: "Rate-limit quota of the request's account (anthropic-ratelimit-* headers)"
+      security: [ { apiKey: [] }, {} ]
+      parameters: [ { in: query, name: refresh, schema: { type: string, enum: ["1"] }, description: "probe with a 1-token request to refresh headers" } ]
+      responses: { "200": { description: ok, content: { application/json: { schema: { $ref: "#/components/schemas/Quota" } } } }, "401": { description: no account } }
+  /admin/accounts:
+    get:
+      tags: [admin]
+      summary: List accounts
+      security: [ { adminKey: [] }, {} ]
+      parameters: [ { in: query, name: quota, schema: { type: string, enum: ["1"] } } ]
+      responses: { "200": { description: ok, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Account" } } } } } }
+    post:
+      tags: [admin]
+      summary: Create account
+      security: [ { adminKey: [] }, {} ]
+      requestBody: { content: { application/json: { schema: { type: object, required: [api_key], properties: { api_key: { type: string }, label: { type: string }, backend: { type: string, enum: [anthropic, bedrock], default: anthropic }, anthropic_key: { type: string }, aws_region: { type: string }, aws_profile: { type: string } } } } } }
+      responses: { "201": { description: created } }
+  /admin/accounts/{api_key}:
+    delete:
+      tags: [admin]
+      security: [ { adminKey: [] }, {} ]
+      parameters: [ { in: path, name: api_key, required: true, schema: { type: string } } ]
+      responses: { "200": { description: deleted }, "404": { description: not found } }
+  /admin/accounts/{api_key}/quota:
+    get:
+      tags: [admin, quota]
+      security: [ { adminKey: [] }, {} ]
+      parameters: [ { in: path, name: api_key, required: true, schema: { type: string } }, { in: query, name: refresh, schema: { type: string } } ]
+      responses: { "200": { description: ok, content: { application/json: { schema: { $ref: "#/components/schemas/Quota" } } } } }
+  /admin/accounts/{api_key}/test:
+    post:
+      tags: [admin]
+      summary: "Smoke-test an account (1 tiny request): latency, response, rate-limit headers"
+      security: [ { adminKey: [] }, {} ]
+      parameters: [ { in: path, name: api_key, required: true, schema: { type: string } } ]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { model: { type: string, default: claude-haiku-4-5 } } } } } }
+      responses: { "200": { description: ok } }

@@ -1,0 +1,18 @@
+[Unit]
+Description=Anthropic Bridge (OpenAI-compatible proxy over the Anthropic Messages API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%WORK_DIR%
+EnvironmentFile=-%WORK_DIR%/.env
+ExecStart=%PYTHON_BIN_DIR%/python3 %WORK_DIR%/server.py --host %HOST% --port %PORT%
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

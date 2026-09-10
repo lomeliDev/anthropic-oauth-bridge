@@ -1,297 +1,147 @@
 #!/usr/bin/env bash
-#
-# Anthropic OAuth → OpenAI Bridge installer
-# Supports: Linux (systemd), macOS (launchd), and a portable fallback script.
-#
-# Usage:
-#   ./install.sh              # Quick install (Python + deps only, use built-in PKCE)
-#   ./install.sh --full       # Full install (adds OpenCode + Claude Code CLI)
-#
+# Anthropic Bridge installer — venv, .env, daemon (systemd/launchd), smoke test.
+# Re-runnable: preserves existing .env values.
 set -euo pipefail
+
+BOLD=$'\033[1m'; RESET=$'\033[0m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; BLUE=$'\033[34m'
+info()    { echo "${BLUE}ℹ${RESET}  $*"; }
+success() { echo "${GREEN}✅${RESET} $*"; }
+warn()    { echo "${YELLOW}⚠${RESET}  $*"; }
+error()   { echo "${RED}❌${RESET} $*" >&2; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
-
-# ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
-MODE="quick"
-for arg in "$@"; do
-    case "$arg" in
-        --full|-f) MODE="full" ;;
-        --help|-h)
-            echo "Usage: ./install.sh [--quick|--full]"
-            echo "  --quick   Install Python deps + start bridge (use built-in PKCE OAuth)"
-            echo "  --full    Also install OpenCode + Claude Code CLI (legacy)"
-            exit 0
-            ;;
-    esac
-done
-
-# ---------------------------------------------------------------------------
-# Pretty output helpers
-# ---------------------------------------------------------------------------
-RESET='\033[0m'
-BOLD='\033[1m'
-CYAN='\033[36m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-
-print_header() {
-    local label="Anthropic OAuth Bridge installer"
-    [[ "$MODE" == "quick" ]] && label="$label (quick)"
-    [[ "$MODE" == "full" ]] && label="$label (full)"
-    echo ""
-    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${CYAN}${BOLD}  $label${RESET}"
-    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
-    echo ""
-}
-
-info()    { echo -e "${CYAN}ℹ${RESET}  $*"; }
-success() { echo -e "${GREEN}✔${RESET}  $*"; }
-warn()    { echo -e "${YELLOW}⚠${RESET}  $*"; }
-error()   { echo -e "${RED}✖${RESET}  $*"; }
-
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
 DEFAULT_PORT=64173
-DEFAULT_CLAUDE_CREDENTIALS="${CLAUDE_CREDENTIALS_PATH:-$HOME/.claude/.credentials.json}"
-DEFAULT_ANTHROPIC_CLIENT_ID="${ANTHROPIC_CLIENT_ID:-9d1c250a-e61b-44d9-88ed-5944d1962f5e}"
 
-CURL="curl -fsSL --connect-timeout 10 --max-time 120"
+echo ""; echo "${BOLD}Anthropic Bridge — installer${RESET}"; echo "────────────────────────────────────────────────"; echo ""
 
-# ---------------------------------------------------------------------------
-# Quick mode: just Python + deps + config
-# ---------------------------------------------------------------------------
-quick_install() {
-    print_header
+# ── Python ────────────────────────────────────────────────────
+PY="$(command -v python3 || true)"
+[[ -n "$PY" ]] || { error "python3 not found"; exit 1; }
+PYV="$("$PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+"$PY" -c 'import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)' || { error "Python 3.10+ required (found $PYV)"; exit 1; }
+[[ -d .venv ]] || "$PY" -m venv .venv
+.venv/bin/pip install -q --upgrade pip >/dev/null
+.venv/bin/pip install -q -r requirements.txt
+success "venv ready (Python $PYV)"
+PYTHON_BIN_DIR="$REPO_DIR/.venv/bin"
 
-    if [[ "$EUID" -eq 0 ]]; then
-        warn "Running as root. Service will be configured for root."
-        read -rp "Continue? [y/N]: " c
-        [[ "${c:-N}" =~ ^[Yy]$ ]] || exit 0
-    fi
+# ── Existing .env ─────────────────────────────────────────────
+env_get() { [[ -f .env ]] && grep -E "^${1}=" .env | tail -1 | cut -d= -f2- || true; }
+E_KEY="$(env_get ANTHROPIC_API_KEY)"; E_BACKEND="$(env_get BRIDGE_BACKEND)"; E_REGION="$(env_get AWS_REGION)"
+E_API="$(env_get BRIDGE_API_KEY)"; E_ADMIN="$(env_get BRIDGE_ADMIN_KEY)"; E_HOST="$(env_get HOST)"; E_PORT="$(env_get PORT)"
 
-    echo ""
-    echo -e "${BOLD}What this does${RESET}"
-    echo "────────────────────────────────────────────────────────────────"
-    echo "  1. Check Python 3.9+"
-    echo "  2. Create virtual environment and install deps"
-    echo "  3. Ask for port, optional API key"
-    echo "  4. Install daemon (systemd/launchd) and start"
-    echo ""
-    echo -e "${CYAN}After install, run: python3 auth-login.py${RESET}"
-    echo -e "${CYAN}to authenticate via the built-in PKCE OAuth flow.${RESET}"
-    echo ""
-
-    # --- Python check ---
-    if ! command -v python3 >/dev/null 2>&1; then
-        error "python3 not found. Install Python 3.9+ first."
-        exit 1
-    fi
-    PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
-    PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
-    if [[ "$PY_MAJOR" -lt 3 ]] || { [[ "$PY_MAJOR" -eq 3 ]] && [[ "$PY_MINOR" -lt 9 ]]; }; then
-        error "Python 3.9+ required. Found ${PY_MAJOR}.${PY_MINOR}."
-        exit 1
-    fi
-    success "Python ${PY_MAJOR}.${PY_MINOR} ready."
-
-    # --- Venv + deps ---
-    if [[ ! -d ".venv" ]]; then
-        info "Creating virtual environment..."
-        python3 -m venv .venv
-    fi
-    info "Installing dependencies..."
-    .venv/bin/pip install -q -r requirements.txt || {
-        error "Failed to install Python dependencies."
-        exit 1
-    }
-    success "Dependencies installed."
-
-    # Detect platform
-    DETECTED_OS="unknown"
-    DETECTED_INIT="none"
-    if [[ "$OSTYPE" == "linux-gnu"* ]] || [[ "$OSTYPE" == "linux"* ]]; then
-        DETECTED_OS="linux"
-        command -v systemctl >/dev/null 2>&1 && DETECTED_INIT="systemd"
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        DETECTED_OS="macos"
-        command -v launchctl >/dev/null 2>&1 && DETECTED_INIT="launchd"
-    fi
-    info "Platform: ${DETECTED_OS} (${DETECTED_INIT})"
-
-    # --- Config ---
-    echo ""
-    echo -e "${BOLD}Configuration${RESET}"
-    echo "────────────────────────────────────────────────────────────────"
-    read -rp "Listen port [${DEFAULT_PORT}]: " PORT
-    PORT="${PORT:-$DEFAULT_PORT}"
-    [[ "$PORT" =~ ^[0-9]+$ ]] && [[ "$PORT" -ge 1 ]] && [[ "$PORT" -le 65535 ]] || {
-        error "Invalid port: ${PORT}"
-        exit 1
-    }
-
-    RANDOM_KEY="$(openssl rand -hex 24 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(24))')"
-    read -rp "Require an API key for clients? [Y/n]: " NEED_KEY
-    NEED_KEY="${NEED_KEY:-Y}"
-    API_KEY=""
-    if [[ "$NEED_KEY" =~ ^[Yy]$ ]]; then
-        read -rp "API key [random]: " API_KEY
-        API_KEY="${API_KEY:-$RANDOM_KEY}"
-        success "API key set."
-    else
-        info "No client auth (open bridge)."
-    fi
-
-    # --- Write .env ---
-    cat > .env <<EOF
-PORT=${PORT}
-CLAUDE_CREDENTIALS_PATH=${DEFAULT_CLAUDE_CREDENTIALS}
-ANTHROPIC_CLIENT_ID=${DEFAULT_ANTHROPIC_CLIENT_ID}
-ANTHROPIC_CLI_VERSION=2.1.202
-EOF
-    [[ -n "$API_KEY" ]] && echo "BRIDGE_API_KEY=${API_KEY}" >> .env
-    chmod 600 .env
-    success "Wrote .env"
-
-    # --- Daemon ---
-    DAEMON_DIR="${REPO_DIR}/daemon"
-    mkdir -p "$DAEMON_DIR"
-    PYTHON_BIN_DIR="${REPO_DIR}/.venv/bin"
-
-    # systemd
-    if [[ "$DETECTED_INIT" == "systemd" ]]; then
-        cat > "${DAEMON_DIR}/anthropic-oauth-bridge.service" <<EOF
-[Unit]
-Description=Anthropic OAuth Bridge
-After=network.target
-
-[Service]
-Type=simple
-User=$(whoami)
-WorkingDirectory=${REPO_DIR}
-EnvironmentFile=${REPO_DIR}/.env
-ExecStart=${PYTHON_BIN_DIR}/python3 ${REPO_DIR}/server.py --port ${PORT}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-    fi
-
-    # launchd
-    if [[ "$DETECTED_INIT" == "launchd" ]]; then
-        cat > "${DAEMON_DIR}/com.lomelidev.anthropic-oauth-bridge.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.lomelidev.anthropic-oauth-bridge</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${PYTHON_BIN_DIR}/python3</string>
-        <string>${REPO_DIR}/server.py</string>
-        <string>--port</string>
-        <string>${PORT}</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PORT</key><string>${PORT}</string>
-        <key>CLAUDE_CREDENTIALS_PATH</key><string>${DEFAULT_CLAUDE_CREDENTIALS}</string>
-        <key>ANTHROPIC_CLIENT_ID</key><string>${DEFAULT_ANTHROPIC_CLIENT_ID}</string>
-EOF
-        [[ -n "$API_KEY" ]] && echo "        <key>BRIDGE_API_KEY</key><string>${API_KEY}</string>" >> "${DAEMON_DIR}/com.lomelidev.anthropic-oauth-bridge.plist"
-        cat >> "${DAEMON_DIR}/com.lomelidev.anthropic-oauth-bridge.plist" <<EOF
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>${REPO_DIR}/bridge.log</string>
-    <key>StandardErrorPath</key><string>${REPO_DIR}/bridge.log</string>
-</dict>
-</plist>
-EOF
-    fi
-
-    # Portable runner
-    cat > "${DAEMON_DIR}/run.sh" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cd "${REPO_DIR}"
-source .env
-exec ${PYTHON_BIN_DIR}/python3 server.py --port ${PORT}
-EOF
-    chmod +x "${DAEMON_DIR}/run.sh"
-    success "Daemon files written."
-
-    # --- Install daemon ---
-    echo ""
-    echo -e "${BOLD}Start service${RESET}"
-    echo "────────────────────────────────────────────────────────────────"
-
-    if [[ "$DETECTED_INIT" == "systemd" ]]; then
-        read -rp "Install and start systemd service? [Y/n]: " INSTALL
-        if [[ "${INSTALL:-Y}" =~ ^[Yy]$ ]]; then
-            local unit="${DAEMON_DIR}/anthropic-oauth-bridge.service"
-            sudo cp "$unit" /etc/systemd/system/ || cp "$unit" /etc/systemd/system/
-            sudo systemctl daemon-reload
-            sudo systemctl enable --now anthropic-oauth-bridge
-            success "systemd service started."
-        fi
-    elif [[ "$DETECTED_INIT" == "launchd" ]]; then
-        read -rp "Install and start launchd agent? [Y/n]: " INSTALL
-        if [[ "${INSTALL:-Y}" =~ ^[Yy]$ ]]; then
-            mkdir -p "$HOME/Library/LaunchAgents"
-            cp "${DAEMON_DIR}/com.lomelidev.anthropic-oauth-bridge.plist" "$HOME/Library/LaunchAgents/"
-            launchctl unload "$HOME/Library/LaunchAgents/com.lomelidev.anthropic-oauth-bridge.plist" 2>/dev/null || true
-            launchctl load -w "$HOME/Library/LaunchAgents/com.lomelidev.anthropic-oauth-bridge.plist"
-            success "launchd agent started."
-        fi
-    else
-        warn "No systemd/launchd detected. Run manually:"
-        info "  ${DAEMON_DIR}/run.sh"
-    fi
-
-    # --- Quick validation ---
-    sleep 2
-    local ok=0
-    curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q "200" && ok=1
-    if [[ "$ok" -eq 1 ]]; then
-        success "Bridge is running on http://127.0.0.1:${PORT}"
-    else
-        warn "Bridge may not be running yet. Check: ${REPO_DIR}/bridge.log"
-    fi
-
-    echo ""
-    echo -e "${GREEN}${BOLD}Done!${RESET}"
-    echo "────────────────────────────────────────────────────────────────"
-    echo "  Bridge:  http://127.0.0.1:${PORT}"
-    [[ -n "$API_KEY" ]] && echo "  API key: ${API_KEY}"
-    echo ""
-    echo "  📌 Next step — authenticate:"
-    echo "     python3 auth-login.py"
-    echo ""
-    echo "  🔧 Manage:"
-    echo "     tail -f bridge.log"
-    [[ "$DETECTED_INIT" == "systemd" ]] && echo "     sudo systemctl status anthropic-oauth-bridge"
-    echo ""
-}
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-if [[ "$MODE" == "quick" ]]; then
-    quick_install
-    exit 0
+# ── Upstream ──────────────────────────────────────────────────
+echo ""; echo "${BOLD}Upstream credential${RESET}"; echo "────────────────────────────────────────────────"
+echo "  [1] Anthropic API key (console.anthropic.com, pay-as-you-go)"
+echo "  [2] AWS Bedrock (uses your AWS credentials/profile; installs boto3)"
+echo ""
+echo "  Note: Claude Pro/Max subscription OAuth is NOT supported — Anthropic's terms"
+echo "  prohibit it in third-party tools (Feb 2026) and enforce it (Apr 2026)."
+echo ""
+read -rp "Backend [${E_BACKEND:-1}]: " BACKEND_CHOICE
+BACKEND_CHOICE="${BACKEND_CHOICE:-${E_BACKEND:-1}}"
+if [[ "$BACKEND_CHOICE" == "2" || "$BACKEND_CHOICE" == "bedrock" ]]; then
+    BACKEND="bedrock"; ANTHROPIC_API_KEY=""
+    read -rp "AWS region [${E_REGION:-us-east-1}]: " AWS_REGION; AWS_REGION="${AWS_REGION:-${E_REGION:-us-east-1}}"
+    read -rp "AWS profile (empty = default chain): " AWS_PROFILE
+    .venv/bin/pip install -q boto3 && success "boto3 installed"
+else
+    BACKEND="anthropic"; AWS_REGION=""; AWS_PROFILE=""
+    read -rp "ANTHROPIC_API_KEY [${E_KEY:+(keep existing)}${E_KEY:-required}]: " ANTHROPIC_API_KEY
+    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$E_KEY}"
+    [[ -n "$ANTHROPIC_API_KEY" ]] || { error "ANTHROPIC_API_KEY is required"; exit 1; }
 fi
 
-# Full mode: OpenCode + Claude Code (legacy path, kept for reference)
-echo "Full mode not yet implemented — use --quick for now."
-echo "Quick mode is the recommended path."
-exit 1
+# ── Server ────────────────────────────────────────────────────
+echo ""; echo "${BOLD}Server${RESET}"; echo "────────────────────────────────────────────────"
+read -rp "Listen host [${E_HOST:-127.0.0.1}] (0.0.0.0 to expose; then set keys!): " BIND_HOST; BIND_HOST="${BIND_HOST:-${E_HOST:-127.0.0.1}}"
+read -rp "Listen port [${E_PORT:-$DEFAULT_PORT}]: " PORT; PORT="${PORT:-${E_PORT:-$DEFAULT_PORT}}"
+GEN_API="$(python3 -c 'import secrets;print("sk-bridge-"+secrets.token_urlsafe(24))')"
+read -rp "Client API key [${E_API:-generate: $GEN_API}] (type 'none' for open access): " API_KEY
+API_KEY="${API_KEY:-${E_API:-$GEN_API}}"; [[ "$API_KEY" == "none" ]] && API_KEY=""
+GEN_ADMIN="$(python3 -c 'import secrets;print("sk-admin-"+secrets.token_urlsafe(24))')"
+read -rp "Admin key [${E_ADMIN:-generate: $GEN_ADMIN}] (type 'none' for open admin): " ADMIN_KEY
+ADMIN_KEY="${ADMIN_KEY:-${E_ADMIN:-$GEN_ADMIN}}"; [[ "$ADMIN_KEY" == "none" ]] && ADMIN_KEY=""
+[[ -z "$API_KEY" && "$BIND_HOST" != "127.0.0.1" ]] && warn "No client key on a non-loopback bind: anyone reaching the port can use your quota."
+
+# ── Write .env ────────────────────────────────────────────────
+cat > .env <<EOF2
+# Anthropic Bridge configuration (generated by install.sh $(date -u +%F))
+HOST=${BIND_HOST}
+PORT=${PORT}
+BRIDGE_DEBUG=0
+BRIDGE_BACKEND=${BACKEND}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+AWS_REGION=${AWS_REGION}
+AWS_PROFILE=${AWS_PROFILE}
+BRIDGE_API_KEY=${API_KEY}
+BRIDGE_ADMIN_KEY=${ADMIN_KEY}
+# BRIDGE_CONTEXT_1M=0
+# BRIDGE_QUOTA_TTL=30
+# BRIDGE_ALLOW_PRIVATE_URLS=0
+EOF2
+chmod 600 .env
+success "Configuration written to .env"
+
+# ── Daemon ────────────────────────────────────────────────────
+DAEMON_DIR="$REPO_DIR/daemon"; mkdir -p "$DAEMON_DIR"
+sed -e "s|%USER%|$(id -un)|g" -e "s|%WORK_DIR%|${REPO_DIR}|g" -e "s|%PYTHON_BIN_DIR%|${PYTHON_BIN_DIR}|g" \
+    -e "s|%HOST%|${BIND_HOST}|g" -e "s|%PORT%|${PORT}|g" anthropic-bridge.service > "$DAEMON_DIR/anthropic-bridge.service"
+cat > "$DAEMON_DIR/com.lomelidev.anthropic-bridge.plist" <<EOF2
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.lomelidev.anthropic-bridge</string>
+  <key>ProgramArguments</key><array>
+    <string>${PYTHON_BIN_DIR}/python3</string><string>${REPO_DIR}/server.py</string>
+    <string>--host</string><string>${BIND_HOST}</string><string>--port</string><string>${PORT}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${REPO_DIR}</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${REPO_DIR}/bridge.log</string>
+  <key>StandardErrorPath</key><string>${REPO_DIR}/bridge.log</string>
+</dict></plist>
+EOF2
+cat > "$DAEMON_DIR/run.sh" <<EOF2
+#!/usr/bin/env bash
+cd "${REPO_DIR}" && exec ${PYTHON_BIN_DIR}/python3 server.py --host ${BIND_HOST} --port ${PORT}
+EOF2
+chmod +x "$DAEMON_DIR/run.sh"
+
+if command -v systemctl >/dev/null 2>&1 && [[ "$(uname -s)" == "Linux" ]]; then
+    read -rp "Install systemd service? [Y/n]: " YN; YN="${YN:-Y}"
+    if [[ "$YN" =~ ^[Yy]$ ]]; then
+        sudo cp "$DAEMON_DIR/anthropic-bridge.service" /etc/systemd/system/anthropic-bridge.service
+        sudo systemctl daemon-reload && sudo systemctl enable --now anthropic-bridge && success "systemd service installed & started"
+    fi
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    read -rp "Install launchd agent? [Y/n]: " YN; YN="${YN:-Y}"
+    if [[ "$YN" =~ ^[Yy]$ ]]; then
+        mkdir -p "$HOME/Library/LaunchAgents"
+        cp "$DAEMON_DIR/com.lomelidev.anthropic-bridge.plist" "$HOME/Library/LaunchAgents/"
+        launchctl unload "$HOME/Library/LaunchAgents/com.lomelidev.anthropic-bridge.plist" 2>/dev/null || true
+        launchctl load -w "$HOME/Library/LaunchAgents/com.lomelidev.anthropic-bridge.plist" && success "launchd agent installed & started"
+    fi
+else
+    info "No systemd/launchd: start manually with $DAEMON_DIR/run.sh"
+fi
+
+# ── Smoke test ────────────────────────────────────────────────
+BASE="http://127.0.0.1:${PORT}"; AUTH=(); [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer ${API_KEY}")
+echo ""; info "Smoke test against $BASE ..."; sleep 2
+for i in 1 2 3 4 5; do curl -s "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+st=$(curl -s "$BASE/health" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status"))' 2>/dev/null || echo "down")
+[[ "$st" == "ok" ]] && success "/health OK" || warn "/health: $st (start the server and re-check)"
+n=$(curl -s "${AUTH[@]}" "$BASE/v1/models" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["data"]))' 2>/dev/null || echo 0)
+[[ "$n" -gt 0 ]] && success "/v1/models: $n models" || warn "/v1/models returned nothing"
+resp=$(curl -s "${AUTH[@]}" -H 'Content-Type: application/json' "$BASE/v1/chat/completions" \
+   -d '{"model":"claude-haiku-4-5","max_tokens":5,"messages":[{"role":"user","content":"reply with exactly: OK"}]}' \
+   | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["choices"][0]["message"]["content"] if "choices" in d else d)' 2>/dev/null || true)
+[[ "$resp" == *OK* ]] && success "/v1/chat/completions OK" || warn "chat: $resp"
+q=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" "$BASE/v1/quota"); [[ "$q" == "200" ]] && success "/v1/quota OK" || warn "/v1/quota $q"
+d=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/docs"); [[ "$d" == "200" ]] && success "/docs OK -> $BASE/docs" || warn "/docs $d"
+echo ""; success "Done."
+[[ -n "$API_KEY" ]]   && info "Client key: $API_KEY"
+[[ -n "$ADMIN_KEY" ]] && info "Admin key:  $ADMIN_KEY"
+info "Swagger UI: $BASE/docs"
