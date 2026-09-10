@@ -98,6 +98,7 @@ model_list:
 - `/docs` — Swagger UI (`openapi.yaml`)
 - `docs/api-reference.md` — every parameter and how it maps to the Messages API
 - `docs/security.md` — what is protected, deployment checklist
+- `docs/reverse-engineering-plan.es.md` — (Spanish) the step-by-step method used to capture a CLI's protocol (isolate, recon with `ss`, mitmproxy, replay with curl, diff) — how the Antigravity bridge was fixed; applies to any CLI
 
 ## 🔒 Security (short version)
 
