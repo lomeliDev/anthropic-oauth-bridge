@@ -99,6 +99,7 @@ model_list:
 - `docs/api-reference.md` — every parameter and how it maps to the Messages API
 - `docs/security.md` — what is protected, deployment checklist
 - `docs/reverse-engineering-plan.es.md` — (Spanish) the step-by-step method used to capture a CLI's protocol (isolate, recon with `ss`, mitmproxy, replay with curl, diff) — how the Antigravity bridge was fixed; applies to any CLI
+- `docs/reverse-engineering-claude-code.es.md` — (Spanish) the same method applied to Claude Code with an API key: `CLAUDE_CONFIG_DIR` isolation, `ANTHROPIC_BASE_URL` logger, what to learn from the capture (prompt-caching breakpoints, tools, thinking replay, compaction), and how to use the logger to debug hooks/MCPs
 
 ## 🔒 Security (short version)
 
